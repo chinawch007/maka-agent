@@ -277,7 +277,7 @@ export function SessionListPanel(props: {
   }
 
   return (
-    <aside className="maka-session-panel" aria-label="Chats">
+    <aside className="maka-session-panel" aria-label="对话列表">
       <header className="maka-session-panel-header">
         <div className="maka-window-drag-strip" aria-hidden="true" />
         <button className="maka-nav-primary" type="button" onClick={props.onNew}>
@@ -345,7 +345,7 @@ export function SessionListPanel(props: {
               setSearchQuery('');
               searchInputRef.current?.focus();
             }}
-            aria-label="Clear search"
+            aria-label="清空搜索"
           >
             ×
           </button>
@@ -379,7 +379,7 @@ export function SessionListPanel(props: {
                       <div className="maka-list-row-meta">
                         {skill.id}
                         {tools.length > 0 && (
-                          <span className="maka-skill-tools" aria-label="Declared tools">
+                          <span className="maka-skill-tools" aria-label="声明的工具">
                             <span className="maka-skill-tools-label">requests</span>
                             <span>{toolsLabel}</span>
                           </span>
@@ -531,7 +531,7 @@ function SessionRow(props: {
               className="maka-list-row-rename-input"
               defaultValue={session.name}
               maxLength={80}
-              aria-label="Rename chat"
+              aria-label="重命名对话"
               onBlur={(event) => commitRename(event.currentTarget.value)}
               onKeyDown={(event) => {
                 // IME guard so committing CJK characters with Enter doesn't
@@ -572,7 +572,7 @@ function SessionRow(props: {
         </button>
       )}
       {actions && !editing && (
-        <div className="maka-list-row-actions" aria-label="Session actions">
+        <div className="maka-list-row-actions" aria-label="对话操作">
           <button
             type="button"
             className="maka-list-row-action"
@@ -592,8 +592,8 @@ function SessionRow(props: {
             type="button"
             className="maka-list-row-action"
             onClick={startRename}
-            aria-label="Rename chat"
-            title="Rename (double-click also works)"
+            aria-label="重命名对话"
+            title="重命名（双击行名也可）"
           >
             <Pencil size={14} strokeWidth={1.75} aria-hidden="true" />
           </button>
@@ -606,8 +606,8 @@ function SessionRow(props: {
                 ? actions.onUnarchive(session.id)
                 : actions.onArchive(session.id);
             }}
-            aria-label={session.isArchived ? 'Unarchive chat' : 'Archive chat'}
-            title={session.isArchived ? 'Unarchive' : 'Archive'}
+            aria-label={session.isArchived ? '取消归档对话' : '归档对话'}
+            title={session.isArchived ? '取消归档' : '归档'}
           >
             {session.isArchived
               ? <ArchiveRestore size={14} strokeWidth={1.75} aria-hidden="true" />
@@ -617,8 +617,8 @@ function SessionRow(props: {
             type="button"
             className="maka-list-row-action maka-list-row-action-danger"
             onClick={handleDelete}
-            aria-label="Delete chat"
-            title="Delete"
+            aria-label="删除对话"
+            title="删除"
           >
             <Trash2 size={14} strokeWidth={1.75} aria-hidden="true" />
           </button>
@@ -747,8 +747,8 @@ export function ChatView(props: {
     return (
       <main className="maka-main detailPane">
         <header className="maka-chat-header">
-          <ChatTab title="New Chat" />
-          <button className="maka-chat-tab-plus" type="button" aria-label="New chat" onClick={props.onNew}>
+          <ChatTab title="新建对话" />
+          <button className="maka-chat-tab-plus" type="button" aria-label="新建对话" onClick={props.onNew}>
             <Plus strokeWidth={1.5} />
           </button>
           <span className="maka-chat-header-spacer" />
@@ -776,7 +776,7 @@ export function ChatView(props: {
             ? props.renderProviderMark(props.activeProviderType)
             : undefined}
         />
-        <button className="maka-chat-tab-plus" type="button" aria-label="New chat" onClick={props.onNew}>
+        <button className="maka-chat-tab-plus" type="button" aria-label="新建对话" onClick={props.onNew}>
           <Plus strokeWidth={1.5} />
         </button>
         <span className="maka-chat-header-spacer" />
@@ -831,7 +831,7 @@ export function ChatView(props: {
             type="button"
             className="maka-chat-jump-bottom"
             onClick={scrollToBottom}
-            aria-label="Jump to latest message"
+            aria-label="跳到最新消息"
           >
             <ArrowDown size={16} strokeWidth={2} aria-hidden="true" />
           </button>
@@ -996,7 +996,7 @@ function EmptyChatHero(props: { onPromptSuggestion?(prompt: string): void; userL
       </h1>
       <p>说一下你要改的、想问的、想查的；下面是几个常用起点。</p>
       {props.onPromptSuggestion && (
-        <ul className="maka-prompt-suggestions" aria-label="Prompt suggestions">
+        <ul className="maka-prompt-suggestions" aria-label="提示建议">
           {PROMPT_SUGGESTIONS.map((suggestion) => (
             <li key={suggestion.label}>
               <button
