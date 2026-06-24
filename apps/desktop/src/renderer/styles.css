@@ -9501,103 +9501,51 @@ button:active {
   line-height: 1.2;
 }
 
+/* Provider catalog + OAuth login render as governed Item rows (media ·
+ * content · actions) — the same shadcn primitive the enabled connections
+ * use — inside a seamless hairline list. This replaces the hand-written
+ * .providerCatalogCard grid so the whole 模型 page speaks one component
+ * language (component governance). */
 .catalogGrid {
   min-height: 0;
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: 1fr;
   align-content: start;
-  gap: 10px;
   overflow: auto;
 }
 
-.providerCatalogCard {
-  height: 124px;
-  min-height: 76px;
-  display: grid;
-  grid-template-columns: 1fr;
-  gap: 6px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: transparent;
-  color: var(--foreground);
-  padding: 10px;
-  text-align: left;
-  transition:
-    border-color 150ms var(--ease-out-strong),
-    background 150ms var(--ease-out-strong),
-    box-shadow 150ms var(--ease-out-strong),
-    transform 150ms var(--ease-out-strong);
+.providerCatalogRow {
+  gap: 12px;
+  padding: 11px 6px;
 }
 
-/* PR-UI-LAYOUT-15 fixup (@kenji review @msg 0e7482e5):
- * Interactive states MUST be scoped to enabled cards. A disabled
- * provider tile that lifts + halos on hover/focus looks actionable
- * — exactly the misrepresentation the provider-surface gate
- * forbids ("不可用 / preview / gated provider 不能呈现为可点击"). */
-.providerCatalogCard:hover:not([data-disabled="true"]) {
-  border-color: oklch(from var(--accent) l c h / 0.28);
-  background: oklch(from var(--accent) l c h / 0.04);
-  transform: translateY(-1px);
-  box-shadow:
-    0 1px 2px oklch(from var(--foreground) l c h / 0.04),
-    0 4px 12px oklch(from var(--accent) l c h / 0.06);
-}
-
-.providerCatalogCard:active:not([data-disabled="true"]) {
-  transform: translateY(0) scale(0.99);
-}
-
-.providerCatalogCard:focus-visible:not([data-disabled="true"]) {
-  outline: none;
-  border-color: oklch(from var(--accent) l c h / 0.42);
-  box-shadow: 0 0 0 3px oklch(from var(--accent) l c h / 0.14);
-}
-
-.providerCatalogCard[data-disabled="true"] {
-  opacity: 0.72;
+/* Gated providers (preview / not-yet-open) stay inert and muted; the
+ * provider-surface gate forbids rendering them as actionable. */
+.providerCatalogRow[data-disabled="true"] {
+  opacity: 0.66;
   cursor: not-allowed;
-}
-
-/* PR-UI-LAYOUT-15 fixup (@kenji review @msg 0e7482e5):
- * Disabled cards still need keyboard focus feedback (a11y) — but
- * the indicator MUST NOT suggest actionability. Muted variant: a
- * neutral border color shift, no accent halo, no lift, no scale.
- * The 1.5px outline-offset keeps the indicator visible against the
- * card chrome without competing with the accent halo used on
- * enabled cards. */
-.providerCatalogCard[data-disabled="true"]:focus-visible {
-  outline: 1.5px dashed var(--foreground-40);
-  outline-offset: 2px;
-}
-
-.providerCatalogCopy {
-  min-width: 0;
-  display: grid;
-  align-content: start;
-  gap: 7px;
+  filter: grayscale(0.28);
 }
 
 .providerCatalogTitle {
-  display: flex;
-  align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  font-weight: 600;
 }
 
-.providerCatalogTitle strong {
-  min-width: 0;
-  overflow-wrap: normal;
-  /* PR-UI-LAYOUT-37: title bumped 12→13px (provider name was
-   * unreadably small for a card title — most peer cards in the
-   * settings use 13-14px). Tile grid `minmax(198px, 1fr)` still
-   * fits comfortably; checked on 1280-width baseline. */
-  font-size: 13px;
-  font-weight: 700;
-  line-height: 1.2;
-}
-
-.providerCatalogTitle em,
 .providerCatalogCount {
+  margin-left: 8px;
+  color: var(--foreground-50);
+  font-size: 12px;
+}
+
+.providerCatalogChevron {
+  flex: 0 0 auto;
+  color: var(--foreground-40);
+}
+
+/* category / preview / login badges — compact squared corners, never pills */
+.providerCatalogBadge {
+  flex: 0 0 auto;
   width: fit-content;
   border-radius: 4px;
   background: var(--foreground-5);
@@ -9605,16 +9553,8 @@ button:active {
   padding: 2px 7px;
   font-size: 10px;
   font-style: normal;
+  font-weight: 600;
   line-height: 1.35;
-}
-
-.providerCatalogCopy small {
-  color: var(--foreground-50);
-  /* PR-UI-LAYOUT-37: description bumped 11→12px so the helper
-   * line under each provider name is readable without forcing
-   * the user to lean in. */
-  font-size: 12px;
-  line-height: 1.4;
 }
 
 .catalogCustom .catalogGrid {
@@ -10041,17 +9981,10 @@ button:active {
 }
 .providerOAuthGrid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(198px, 1fr));
-  align-content: start;
-  gap: 12px;
+  grid-template-columns: 1fr;
   overflow: auto;
-  padding-right: 4px;
-}
-
-.providerOAuthGrid .providerCatalogCard {
-  width: 100%;
-  max-width: 286px;
-  min-height: 172px;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
 }
 
 .providerOAuthCardBadge {
@@ -10311,95 +10244,37 @@ button:active {
 
 .providerMarketGrid,
 .settingsSurface[data-modal="true"] .providerMarketGrid {
-  grid-template-columns: repeat(auto-fill, minmax(198px, 1fr));
-  gap: 12px;
+  grid-template-columns: 1fr;
   overflow: auto;
-  padding-right: 4px;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
 }
 
-.providerMarketGrid .providerCatalogCard {
-  width: 100%;
-  max-width: 286px;
-  min-height: 172px;
+.providerMarketGrid .providerCatalogRow + .providerCatalogRow,
+.providerOAuthGrid .providerCatalogRow + .providerCatalogRow {
+  border-top: 1px solid oklch(from var(--foreground) l c h / 0.06);
 }
 
-.providerCatalogCard {
-  position: relative;
-  overflow: hidden;
-  transition:
-    transform 160ms ease,
-    border-color 160ms ease,
-    background-color 160ms ease,
-    box-shadow 160ms ease;
+/* Logo plates match the enabled list (compact 32px) so the page reads as
+ * one column of provider rows top to bottom. */
+.providerCatalogRow .providerLogo {
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
 }
 
-/* PR-UI-PROV-POLISH fixup v3 (@xuan source-gate msg d2fdec44):
- * Older PR-UI-1 rules also need the disabled guard so the
- * grep-level gate ("any providerCatalogCard hover/active rule that
- * applies actionable affordance must exclude disabled cards") holds
- * file-wide, not just for the new LAYOUT-15 rules above. */
-.providerMarketGrid .providerCatalogCard:hover:not([data-disabled="true"]) {
-  transform: translateY(-1px);
-  border-color: oklch(from var(--accent) l c h / 0.2);
-  box-shadow: 0 12px 28px oklch(0.35 0.02 90 / 0.08);
-}
-
-.providerCatalogCard:active:not([data-disabled="true"]) {
-  transform: translateY(1px);
-}
-
-.providerCatalogCard[data-status="unavailable"],
-.providerCatalogCard[data-status="experimental"] {
-  cursor: not-allowed;
-  filter: grayscale(0.28);
-  opacity: 0.66;
-}
-
-.providerCatalogCard[data-status="unavailable"]:hover,
-.providerCatalogCard[data-status="experimental"]:hover {
-  transform: none;
-  border-color: var(--border);
-  box-shadow: none;
-}
-
-/* PR-UI-LAYOUT-41 follow-up (@kenji gate 2): defensive — the
- * disabled card is rendered as `<div>` so `:focus-visible` never
- * matches it (divs aren't focusable without tabindex). This rule
- * is here as a belt-and-suspenders override in case some future
- * change accidentally adds tabindex / contenteditable / button
- * fallback. */
-.providerCatalogCard[data-status="unavailable"]:focus-visible,
-.providerCatalogCard[data-status="experimental"]:focus-visible {
-  outline: none;
-  box-shadow: none;
-  border-color: var(--border);
-}
-
-.providerCatalogCard[data-status="unavailable"]::after {
-  content: "未开放";
-  position: absolute;
-  top: 10px;
-  right: 10px;
-  border-radius: 4px;
-  background: oklch(from var(--info) l c h / 0.12);
+/* Gated providers carry a real trailing state badge in ItemActions (not an
+ * absolute ::after), tinted by the gate reason. The row itself is a plain
+ * div Item with no render prop, so it is inert — the provider-surface gate
+ * never lets a gated provider read as clickable. */
+.providerCatalogRow[data-status="unavailable"] .providerCatalogBadge.is-state {
+  background: oklch(from var(--info) l c h / 0.14);
   color: var(--info-text);
-  padding: 2px 8px;
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0;
 }
 
-.providerCatalogCard[data-status="experimental"]::after {
-  content: "实验";
-  position: absolute;
-  top: 10px;
-  right: 10px;
-  border-radius: 4px;
+.providerCatalogRow[data-status="experimental"] .providerCatalogBadge.is-state {
   background: oklch(from var(--warning) l c h / 0.14);
   color: var(--warning-text);
-  padding: 2px 8px;
-  font-size: 10px;
-  font-weight: 700;
 }
 
 /* PR-UI-13 (@yuejing 2026-05-22): ProviderLogo size normalization.
@@ -10444,24 +10319,6 @@ button:active {
   display: block;
 }
 
-.providerCatalogCard .providerCatalogTitle {
-  margin-top: 2px;
-}
-
-.providerCatalogCard .providerCatalogCopy {
-  gap: 8px;
-}
-
-.providerCatalogCard .providerCatalogCopy small {
-  max-width: 32ch;
-}
-
-.providerCatalogTitle em,
-.providerCatalogCount {
-  background: var(--foreground-5);
-  color: var(--foreground-50);
-  font-weight: 600;
-}
 
 .customProviderEntry {
   display: flex;
@@ -10469,8 +10326,6 @@ button:active {
   justify-content: space-between;
   gap: 16px;
   border-top: 1px solid var(--border);
-  background: linear-gradient(180deg, transparent, oklch(0.97 0.01 90 / 0.58));
-  border-radius: 0 0 14px 14px;
   padding-top: 14px;
 }
 

@@ -21,7 +21,7 @@ import {
   Button,
   PrimitiveTabs, PrimitiveTabsList, PrimitiveTabsTrigger,
   PrimitiveAccordion, PrimitiveAccordionItem, PrimitiveAccordionHeader, PrimitiveAccordionTrigger, PrimitiveAccordionPanel,
-  Item, ItemContent, ItemTitle, ItemActions,
+  Item, ItemMedia, ItemContent, ItemTitle, ItemDescription, ItemActions,
   Input, RelativeTime, Textarea, useToast, useModalA11y,
 } from '@maka/ui';
 import { formatRelativeTimestamp } from '@maka/core';
@@ -540,45 +540,56 @@ function ProviderCatalogCard(props: { type: ProviderType; count: number; onSelec
 
   if (disabled) {
     return (
-      <div
-        className="providerCatalogCard"
+      <Item
+        className="providerCatalogRow rounded-none"
         data-provider={props.type}
         data-status={disabledStatus}
+        data-disabled="true"
         aria-label={providerDisabledAriaLabel(props.type, display.name)}
         title={title}
       >
-        <ProviderLogo type={props.type} />
-        <span className="providerCatalogCopy">
-          <span className="providerCatalogTitle">
-            <strong>{display.name}</strong>
+        <ItemMedia>
+          <ProviderLogo type={props.type} />
+        </ItemMedia>
+        <ItemContent>
+          <ItemTitle className="providerCatalogTitle">{display.name}</ItemTitle>
+          <ItemDescription className="providerCatalogDesc">{display.description}</ItemDescription>
+        </ItemContent>
+        <ItemActions>
+          <span className="providerCatalogBadge is-state" aria-hidden="true">
+            {disabledStatus === 'experimental' ? '实验' : '未开放'}
           </span>
-          <small>{display.description}</small>
-        </span>
-      </div>
+        </ItemActions>
+      </Item>
     );
   }
 
   return (
-    <Button
-      className="providerCatalogCard"
-      variant="ghost"
+    <Item
+      className="providerCatalogRow rounded-none"
       data-provider={props.type}
       data-status="ready"
-      type="button"
       aria-label={providerCatalogAriaLabel(display, props.count)}
       title={title}
-      onClick={props.onSelect}
+      render={<button type="button" onClick={props.onSelect} />}
     >
-      <ProviderLogo type={props.type} />
-      <span className="providerCatalogCopy">
-        <span className="providerCatalogTitle">
-          <strong>{display.name}</strong>
-          {display.badge && <em>{display.badge}</em>}
-        </span>
-        <small>{display.description}</small>
-        {props.count > 0 && <span className="providerCatalogCount">已配置 {props.count} 个</span>}
-      </span>
-    </Button>
+      <ItemMedia>
+        <ProviderLogo type={props.type} />
+      </ItemMedia>
+      <ItemContent>
+        <ItemTitle className="providerCatalogTitle">
+          {display.name}
+          {display.badge && <span className="providerCatalogBadge">{display.badge}</span>}
+        </ItemTitle>
+        <ItemDescription className="providerCatalogDesc">
+          {display.description}
+          {props.count > 0 && <span className="providerCatalogCount">已配置 {props.count} 个</span>}
+        </ItemDescription>
+      </ItemContent>
+      <ItemActions>
+        <ChevronRight className="providerCatalogChevron" size={15} strokeWidth={2} aria-hidden="true" />
+      </ItemActions>
+    </Item>
   );
 }
 
@@ -772,28 +783,31 @@ function ModelOAuthSection(props: { onConnectionsChanged(): Promise<void> }) {
             ? snapshot.email
             : card.description;
           return (
-            <Button
+            <Item
               key={card.id}
-              type="button"
-              variant="ghost"
-              className="providerCatalogCard providerOAuthCard"
+              className="providerCatalogRow providerOAuthCard rounded-none"
               data-card-id={card.id}
               data-provider={card.providerType}
               data-status="ready"
               data-oauth-status={card.status}
               data-logged-in={isLoggedIn ? 'true' : undefined}
               aria-label={providerOAuthAriaLabel(card, liveBadge, liveDescription)}
-              onClick={() => setOpenModal(card.id)}
+              render={<button type="button" onClick={() => setOpenModal(card.id)} />}
             >
-              <ProviderLogo type={card.providerType} />
-              <span className="providerCatalogCopy providerOAuthCardCopy">
-                <span className="providerCatalogTitle">
-                  <strong>{card.name}</strong>
-                  <em className="providerOAuthCardBadge">{liveBadge}</em>
-                </span>
-                <small className="providerOAuthCardDescription">{liveDescription}</small>
-              </span>
-            </Button>
+              <ItemMedia>
+                <ProviderLogo type={card.providerType} />
+              </ItemMedia>
+              <ItemContent>
+                <ItemTitle className="providerCatalogTitle">
+                  {card.name}
+                  <span className="providerCatalogBadge providerOAuthCardBadge">{liveBadge}</span>
+                </ItemTitle>
+                <ItemDescription className="providerCatalogDesc providerOAuthCardDescription">{liveDescription}</ItemDescription>
+              </ItemContent>
+              <ItemActions>
+                <ChevronRight className="providerCatalogChevron" size={15} strokeWidth={2} aria-hidden="true" />
+              </ItemActions>
+            </Item>
           );
         })}
       </div>

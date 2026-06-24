@@ -467,8 +467,8 @@ describe('Model OAuth catalog contract (PR-MODEL-OAUTH-ALL-0 + PR-CLAUDE-CARD-MO
 
     assert.match(
       section,
-      /className="providerCatalogCard providerOAuthCard"/,
-      'OAuth tab cards must reuse the same provider catalog card chrome as 国内 / 海外 / 本地 cards',
+      /className="providerCatalogRow providerOAuthCard rounded-none"/,
+      'OAuth tab rows must reuse the same governed provider catalog row chrome as 国内 / 海外 / 本地 rows',
     );
     assert.match(
       section,
@@ -477,8 +477,8 @@ describe('Model OAuth catalog contract (PR-MODEL-OAUTH-ALL-0 + PR-CLAUDE-CARD-MO
     );
     assert.match(
       section,
-      /className="providerCatalogCopy providerOAuthCardCopy"[\s\S]*className="providerCatalogTitle"/,
-      'OAuth cards must reuse the same title/description hierarchy as provider catalog cards',
+      /<ItemTitle className="providerCatalogTitle"[\s\S]*<ItemDescription className="providerCatalogDesc providerOAuthCardDescription"/,
+      'OAuth rows must reuse the same Item title/description hierarchy as provider catalog rows',
     );
     assert.doesNotMatch(
       section,
@@ -488,28 +488,28 @@ describe('Model OAuth catalog contract (PR-MODEL-OAUTH-ALL-0 + PR-CLAUDE-CARD-MO
 
     assert.match(
       styles,
-      /\.providerMarketGrid,[\s\S]*?grid-template-columns:\s*repeat\(auto-fill,\s*minmax\(198px,\s*1fr\)\)/,
-      'provider market tabs must use stable auto-fill columns so 国内 and 海外 card widths do not diverge',
+      /\.providerMarketGrid,[\s\S]*?grid-template-columns:\s*1fr/,
+      'provider market tabs must use a single-column seamless row list so 国内 and 海外 stay visually identical',
     );
     assert.match(
       styles,
-      /\.providerCatalogCard\s*\{[\s\S]*?height:\s*172px;/,
-      'provider catalog cards need a fixed shared height so tab content does not jump between categories',
+      /\.providerCatalogRow\s*\{/,
+      'provider catalog + OAuth rows share the governed .providerCatalogRow chrome so the tabs do not look like unrelated surfaces',
     );
     assert.match(
       styles,
-      /\.providerOAuthGrid\s*\{[\s\S]*?grid-template-columns:\s*repeat\(auto-fill,\s*minmax\(198px,\s*1fr\)\)[\s\S]*?align-content:\s*start;/,
-      'OAuth tab must use the same 198px provider grid as the API-key provider tabs without stretching the card row',
+      /\.providerOAuthGrid\s*\{[\s\S]*?grid-template-columns:\s*1fr/,
+      'OAuth tab must use the same single-column row list as the API-key provider tabs',
     );
     assert.match(
       styles,
-      /\.providerMarketGrid \.providerCatalogCard\s*\{[\s\S]*?max-width:\s*286px;[\s\S]*?min-height:\s*172px;/,
-      'API-key provider cards must use the same fixed card height as OAuth cards',
+      /\.providerMarketGrid \.providerCatalogRow \+ \.providerCatalogRow/,
+      'API-key provider rows must use the same seamless hairline separators as OAuth rows',
     );
     assert.match(
       styles,
-      /\.providerOAuthGrid \.providerCatalogCard\s*\{[\s\S]*?max-width:\s*286px;[\s\S]*?min-height:\s*172px;/,
-      'OAuth cards must use the same max width and minimum height as provider catalog cards',
+      /\.providerOAuthGrid \.providerCatalogRow \+ \.providerCatalogRow/,
+      'OAuth rows must use the same seamless hairline separators as provider catalog rows',
     );
     assert.match(
       styles,
