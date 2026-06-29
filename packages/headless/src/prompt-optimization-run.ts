@@ -1,8 +1,6 @@
-import { execFile } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { promisify } from 'node:util';
 import type { LlmConnection } from '@maka/core';
 import type { Config } from './contracts.js';
 import type { FixedPromptTask, HarborTaskRunner } from './fixed-prompt-controller.js';
@@ -13,8 +11,6 @@ import {
   runPromptOptimizationLoop,
   type PromptOptimizationLoopResult,
 } from './prompt-optimization-loop.js';
-
-const execFileAsync = promisify(execFile);
 
 /**
  * Real-run wiring for the RSI prompt-optimization loop: discover and partition
@@ -245,10 +241,6 @@ export async function runPromptOptimizationRun(
   });
 
   const git = createCliPromptCandidateGit({ cwd: input.gitCwdPath, systemPromptPath: input.systemPromptPath });
-  const originalCommitSha = (
-    await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: input.gitCwdPath })
-  ).stdout.trim();
-
   const config: Config = {
     id: input.runId,
     backend: 'ai-sdk',
@@ -274,7 +266,6 @@ export async function runPromptOptimizationRun(
     harborRunner,
     metaAgent,
     git,
-    originalCommitSha,
     rewardHackVerifierPatternsByTaskId: input.rewardHackVerifierPatternsByTaskId,
     ...(input.resumeFingerprint ? { resumeFingerprint: input.resumeFingerprint } : {}),
     ...(input.costCeilingUsd !== undefined ? { costCeilingUsd: input.costCeilingUsd } : {}),

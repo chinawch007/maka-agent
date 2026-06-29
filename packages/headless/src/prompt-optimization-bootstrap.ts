@@ -3,6 +3,11 @@ import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { readFixedPromptWal } from './fixed-prompt-controller.js';
+import {
+  reconcilePromptRepoWithReplayState,
+  derivePromptOptimizationReplayState,
+  replayStateHasRecoverablePendingCandidateEvidence,
+} from './prompt-optimization-replay.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -32,9 +37,8 @@ export async function ensurePromptOptimizationPromptRepo(
       await commitSeed(input.promptRepoDir);
       return { agentCwdPath, programPath, systemPromptPath };
     }
-    await assertPromptRepoHeadIsSeed(input.promptRepoDir);
-    await assertExistingSeedFile(programPath, input.program);
-    await assertExistingSeedFile(systemPromptPath, input.systemPrompt);
+    const seedCommitSha = await gitOutput(input.promptRepoDir, 'rev-list', '--max-parents=0', 'HEAD');
+    await assertSeedCommitFilesMatchInput(input, seedCommitSha);
     return { agentCwdPath, programPath, systemPromptPath };
   }
 
@@ -44,31 +48,46 @@ export async function ensurePromptOptimizationPromptRepo(
   return { agentCwdPath, programPath, systemPromptPath };
 }
 
-export async function assertPromptOptimizationResumeSupported(input: {
+export async function preparePromptOptimizationResume(input: {
   promptRepoDir: string;
   resultsJsonlPath: string;
 }): Promise<void> {
-  await assertPromptRepoHeadIsSeed(input.promptRepoDir);
   const events = await readFixedPromptWal(input.resultsJsonlPath);
-  for (const event of events) {
-    if (event.type === 'prompt_candidate_committed' || event.type === 'prompt_candidate_decided') {
-      throw unsupportedPostCandidateResumeError();
-    }
-  }
-}
-
-async function assertPromptRepoHeadIsSeed(promptRepoDir: string): Promise<void> {
-  const head = await gitOutput(promptRepoDir, 'rev-parse', 'HEAD');
-  const seedCommitSha = await gitOutput(promptRepoDir, 'rev-list', '--max-parents=0', 'HEAD');
-  if (head !== seedCommitSha) {
-    throw unsupportedPostCandidateResumeError();
-  }
+  const replayState = await derivePromptOptimizationReplayState({
+    events,
+    promptRepoDir: input.promptRepoDir,
+  });
+  await reconcilePromptRepoWithReplayState({
+    gitRootPath: input.promptRepoDir,
+    expectedHead: replayState.expectedPromptRepoHead,
+    programPath: join(input.promptRepoDir, 'program.md'),
+    systemPromptGitPath: 'system_prompt.md',
+    ...(replayStateHasRecoverablePendingCandidateEvidence({ events, state: replayState })
+      ? { recoverExpectedHeadFromParent: true }
+      : {}),
+  });
 }
 
 async function assertExistingSeedFile(path: string, expected: string): Promise<void> {
   const actual = await readFile(path, 'utf8');
   if (actual !== expected) {
     throw new Error(`existing prompt repo seed files do not match this run: ${path}`);
+  }
+}
+
+async function assertSeedCommitFilesMatchInput(
+  input: EnsurePromptOptimizationPromptRepoInput,
+  seedCommitSha: string,
+): Promise<void> {
+  const [program, systemPrompt] = await Promise.all([
+    gitBlob(input.promptRepoDir, `${seedCommitSha}:program.md`),
+    gitBlob(input.promptRepoDir, `${seedCommitSha}:system_prompt.md`),
+  ]);
+  if (program !== input.program) {
+    throw new Error('existing prompt repo seed files do not match this run: program.md');
+  }
+  if (systemPrompt !== input.systemPrompt) {
+    throw new Error('existing prompt repo seed files do not match this run: system_prompt.md');
   }
 }
 
@@ -117,6 +136,11 @@ async function gitOutput(cwd: string, ...args: string[]): Promise<string> {
   return stdout.trim();
 }
 
+async function gitBlob(cwd: string, refPath: string): Promise<string> {
+  const { stdout } = await execFileAsync('git', ['show', refPath], { cwd, encoding: 'utf8' });
+  return stdout;
+}
+
 async function pathExists(path: string): Promise<boolean> {
   try {
     await stat(path);
@@ -127,12 +151,6 @@ async function pathExists(path: string): Promise<boolean> {
     }
     throw error;
   }
-}
-
-function unsupportedPostCandidateResumeError(): Error {
-  return new Error(
-    'post-candidate RSI resume is not supported yet; use a new MAKA_PROMPT_RUN_ID or implement whole-loop WAL replay before resuming after candidate commits/decisions',
-  );
 }
 
 function isNotFound(error: unknown): boolean {

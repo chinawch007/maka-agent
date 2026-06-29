@@ -1,10 +1,12 @@
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import type { Config } from './contracts.js';
 import {
   appendFixedPromptWalEvent,
   FIXED_PROMPT_WAL_SCHEMA_VERSION,
   runFixedPromptController,
   readFixedPromptWal,
+  writeFixedPromptResultsTsv,
   type FixedPromptControllerResult,
   type FixedPromptTask,
   type FixedPromptTaskCompletedEvent,
@@ -40,8 +42,18 @@ import { analyzeRsiRound } from './rsi-round-analysis.js';
 import {
   buildRsiControllerAttribution,
   projectRsiPromptAttribution,
+  type RsiControllerAttribution,
   type RsiPromptAttribution,
 } from './rsi-controller-attribution.js';
+import {
+  assertCandidateMatchesStableTaskSet,
+  reconcilePromptRepoWithReplayState,
+  assertReplayedDecisionMatchesResult,
+  buildPromptOptimizationReplayPlan,
+  replayStateHasRecoverablePendingCandidateEvidence,
+  replayPromptBaselinePartition,
+  replayPromptDecisionRound,
+} from './prompt-optimization-replay.js';
 
 /**
  * Top-level driver for the RSI prompt-optimization loop (Issue #64).
@@ -95,8 +107,6 @@ export interface PromptOptimizationLoopInput {
   harborRunner: HarborTaskRunner;
   metaAgent: MetaAgent;
   git: PromptCandidateGit;
-  /** HEAD of the prompt repo before any candidate commit. */
-  originalCommitSha: string;
 
   /** Verifier strings, by task id, that must not be visible to the model. A
    * held-in task that completes without configured patterns quarantines the
@@ -177,6 +187,28 @@ export async function runPromptOptimizationLoop(
   if (input.costCeilingUsd !== undefined) assertFinitePositive('costCeilingUsd', input.costCeilingUsd);
   if (input.maxInfraFailureRate !== undefined) assertRatio('maxInfraFailureRate', input.maxInfraFailureRate);
   if (input.maxConcurrency !== undefined) assertPositiveInt('maxConcurrency', input.maxConcurrency);
+
+  const resumeEvents = await readFixedPromptWal(input.resultsJsonlPath);
+  const replayPlan = await buildPromptOptimizationReplayPlan({
+    events: resumeEvents,
+    promptRepoDir: input.git.gitRootPath,
+    systemPromptGitPath: input.git.systemPromptGitPath,
+    runId: input.runId,
+    ...(input.resumeFingerprint ? { resumeFingerprint: input.resumeFingerprint } : {}),
+    strictRoundState: true,
+  });
+  const replayState = replayPlan.state;
+  await reconcilePromptRepoWithReplayState({
+    gitRootPath: input.git.gitRootPath,
+    expectedHead: replayState.expectedPromptRepoHead,
+    programPath: input.programPath,
+    systemPromptGitPath: input.git.systemPromptGitPath,
+    ...(replayStateHasRecoverablePendingCandidateEvidence({
+      events: resumeEvents,
+      state: replayState,
+      runId: input.runId,
+    }) ? { recoverExpectedHeadFromParent: true } : {}),
+  });
 
   const heldInTaskIds = input.heldInTasks.map((task) => task.id);
   const heldOutTaskIds = input.heldOutTasks.map((task) => task.id);
@@ -274,7 +306,22 @@ export async function runPromptOptimizationLoop(
       );
     }
     const roundId = `baseline-${index}`;
-    const heldIn = await sweep(roundId, input.heldInTasks, input.heldInResultsTsvPath);
+    const heldInReplayInput = {
+      events: resumeEvents,
+      runId: input.runId,
+      roundId,
+      taskIds: heldInTaskIds,
+      expectedPromptHash: replayPlan.seedPromptHash,
+      ...(input.resumeFingerprint ? { resumeFingerprint: input.resumeFingerprint } : {}),
+      resultsTsvPath: input.heldInResultsTsvPath,
+    };
+    const replayedHeldIn = replayPromptBaselinePartition({
+      ...heldInReplayInput,
+      partition: 'held-in',
+      required: replayPlan.historicalBaselineEvidenceRequired,
+    });
+    if (replayedHeldIn) await writeFixedPromptResultsTsv(input.heldInResultsTsvPath, replayedHeldIn.events);
+    const heldIn = replayedHeldIn ?? await sweep(roundId, input.heldInTasks, input.heldInResultsTsvPath);
     accumulate(heldIn);
     const postHeldInGuard = stopGuard();
     if (postHeldInGuard) {
@@ -283,7 +330,22 @@ export async function runPromptOptimizationLoop(
         + 'raise the budget or lower baselineRuns',
       );
     }
-    const heldOut = await sweep(roundId, input.heldOutTasks, input.heldOutResultsTsvPath);
+    const heldOutReplayInput = {
+      events: resumeEvents,
+      runId: input.runId,
+      roundId,
+      taskIds: heldOutTaskIds,
+      expectedPromptHash: replayPlan.seedPromptHash,
+      ...(input.resumeFingerprint ? { resumeFingerprint: input.resumeFingerprint } : {}),
+      resultsTsvPath: input.heldOutResultsTsvPath,
+    };
+    const replayedHeldOut = replayPromptBaselinePartition({
+      ...heldOutReplayInput,
+      partition: 'held-out',
+      required: replayPlan.historicalBaselineEvidenceRequired,
+    });
+    if (replayedHeldOut) await writeFixedPromptResultsTsv(input.heldOutResultsTsvPath, replayedHeldOut.events);
+    const heldOut = replayedHeldOut ?? await sweep(roundId, input.heldOutTasks, input.heldOutResultsTsvPath);
     accumulate(heldOut);
     baselineRunsData.push({ heldInEvents: heldIn.events, heldOutEvents: heldOut.events });
   }
@@ -345,7 +407,7 @@ export async function runPromptOptimizationLoop(
   });
 
   const originalHeldOutEvents = stableHeldOut(baselineRunsData[0]!.heldOutEvents);
-  let lastKeptCommitSha = input.originalCommitSha;
+  let lastKeptCommitSha = replayState.seedCommitSha;
   let heldInReference = baseline.heldIn.referencePassEligibleRate;
   let lastKeptHeldInEvents: readonly FixedPromptTaskWalEvent[] = stableHeldIn(baselineRunsData[0]!.heldInEvents);
   let previousCandidateHeldInEvents: readonly FixedPromptTaskWalEvent[] | undefined;
@@ -371,7 +433,98 @@ export async function runPromptOptimizationLoop(
       ...(previousCandidateHeldInEvents ? { previousCandidateEvents: previousCandidateHeldInEvents } : {}),
       candidateEvents: latestHeldInFeedbackEvents,
     });
-    const candidate = await runPromptCandidateRound({
+    const existingDecisionRound = replayPromptDecisionRound({
+      events: resumeEvents,
+      state: replayState,
+      runId: input.runId,
+      roundId,
+      heldInTaskIds: stableHeldInTaskIds,
+      heldOutTaskIds: stableHeldOutTaskIds,
+      ...(input.resumeFingerprint ? { resumeFingerprint: input.resumeFingerprint } : {}),
+      heldInResultsTsvPath: input.heldInResultsTsvPath,
+      heldOutResultsTsvPath: input.heldOutResultsTsvPath,
+    });
+    if (existingDecisionRound) {
+      await writeFixedPromptResultsTsv(input.heldInResultsTsvPath, existingDecisionRound.heldIn.events);
+      if (existingDecisionRound.heldOut) {
+        await writeFixedPromptResultsTsv(input.heldOutResultsTsvPath, existingDecisionRound.heldOut.events);
+      }
+      const existingHeldInEvents = existingDecisionRound.heldIn.events;
+      accumulate(existingDecisionRound.heldIn);
+      if (existingDecisionRound.heldOut) accumulate(existingDecisionRound.heldOut);
+      const replayedRewardHackScan = await scanHeldIn(existingHeldInEvents);
+      if (
+        !existingDecisionRound.heldOut
+        && heldInGateReason({
+          heldInTaskIds: stableHeldInTaskIds,
+          lastKeptHeldInEvents,
+          candidateHeldInEvents: existingHeldInEvents,
+          previousHeldInReferencePassEligibleRate: heldInReference,
+          heldInPassRateNoiseBand: baseline.heldIn.noiseBand,
+          rewardHackScan: replayedRewardHackScan,
+        }) === null
+      ) {
+        throw new Error(`RSI WAL replay missing required held-out task evidence for ${roundId}`);
+      }
+      const replayedResult = decidePromptAcceptance({
+        runId: input.runId,
+        roundId,
+        candidateCommitSha: existingDecisionRound.decision.candidateCommitSha,
+        previousLastKeptCommitSha: lastKeptCommitSha,
+        originalCommitSha: replayState.seedCommitSha,
+        heldInTaskIds: stableHeldInTaskIds,
+        heldOutTaskIds: stableHeldOutTaskIds,
+        previousHeldInReferencePassEligibleRate: heldInReference,
+        originalHeldOutPassEligibleRate: baseline.heldOut.originalPassEligibleRate,
+        heldInPassRateNoiseBand: baseline.heldIn.noiseBand,
+        heldOutPassRateNoiseBand: baseline.heldOut.noiseBand,
+        originalEvents: originalHeldOutEvents,
+        lastKeptEvents: lastKeptHeldInEvents,
+        candidateEvents: [...existingHeldInEvents, ...(existingDecisionRound.heldOut?.events ?? [])],
+        rewardHackScan: replayedRewardHackScan,
+      });
+      assertReplayedDecisionMatchesResult(existingDecisionRound.decision, replayedResult);
+      const replayedCandidate = replayState.candidateByRoundId.get(roundId);
+      if (!replayedCandidate) {
+        throw new Error(`RSI WAL replay missing candidate commit for decided ${roundId}`);
+      }
+      const replayedAttribution = buildRsiControllerAttribution({
+        runId: input.runId,
+        roundId,
+        candidateCommitSha: existingDecisionRound.decision.candidateCommitSha,
+        candidateRationaleHash: replayedCandidate.candidateRationaleHash,
+        candidateRationale: replayedCandidate.candidateRationale,
+        promptTimeAnalysis: promptAnalysis,
+        analysis: await analyzeRsiRound({
+          heldInTaskIds: stableHeldInTaskIds,
+          lastKeptEvents: lastKeptHeldInEvents,
+          ...(previousCandidateHeldInEvents ? { previousCandidateEvents: previousCandidateHeldInEvents } : {}),
+          candidateEvents: existingHeldInEvents,
+        }),
+        heldInTaskIds: stableHeldInTaskIds,
+        lastKeptEvents: lastKeptHeldInEvents,
+        candidateEvents: existingHeldInEvents,
+        decision: replayedResult,
+      });
+      assertReplayedAttributionMatchesResult(existingDecisionRound.attribution, replayedAttribution);
+      decisions.push(replayedResult);
+      if (replayedResult.decision === 'keep') {
+        lastKeptCommitSha = replayedResult.lastKeptCommitSha;
+        heldInReference = replayedResult.heldInReferencePassEligibleRate;
+        lastKeptHeldInEvents = existingHeldInEvents;
+      }
+      previousCandidateHeldInEvents = existingHeldInEvents;
+      latestHeldInFeedbackEvents = existingHeldInEvents;
+      nextHeldInDigests = await digestsFor(existingHeldInEvents);
+      nextPromptAttribution = projectRsiPromptAttribution(existingDecisionRound.attribution);
+      continue;
+    }
+
+    const existingCandidate = replayState.candidateByRoundId.get(roundId);
+    if (existingCandidate) {
+      assertCandidateMatchesStableTaskSet(existingCandidate, stableHeldInTaskIds);
+    }
+    const candidate = existingCandidate ?? await runPromptCandidateRound({
       runId: input.runId,
       roundId,
       agentCwdPath: input.agentCwdPath,
@@ -408,7 +561,6 @@ export async function runPromptOptimizationLoop(
       heldInPassRateNoiseBand: baseline.heldIn.noiseBand,
       rewardHackScan,
     });
-
     let heldOutEvents: readonly FixedPromptTaskWalEvent[] = [];
     if (heldInGate === null) {
       // Held-in cleared, but the held-in sweep itself can have exhausted the
@@ -432,7 +584,7 @@ export async function runPromptOptimizationLoop(
       roundId,
       candidateCommitSha: candidate.commitSha,
       previousLastKeptCommitSha: lastKeptCommitSha,
-      originalCommitSha: input.originalCommitSha,
+      originalCommitSha: replayState.seedCommitSha,
       heldInTaskIds: stableHeldInTaskIds,
       heldOutTaskIds: stableHeldOutTaskIds,
       previousHeldInReferencePassEligibleRate: heldInReference,
@@ -539,5 +691,27 @@ function assertDisjointTaskIds(heldInTaskIds: readonly string[], heldOutTaskIds:
   const overlap = [...new Set(heldOutTaskIds.filter((taskId) => heldIn.has(taskId)))].sort();
   if (overlap.length > 0) {
     throw new Error(`held-in and held-out tasks overlap: ${overlap.join(', ')}`);
+  }
+}
+
+function assertReplayedAttributionMatchesResult(
+  event: RsiControllerAttributionEvent,
+  expected: RsiControllerAttribution,
+): void {
+  const actual = {
+    runId: event.runId,
+    roundId: event.roundId,
+    candidateCommitSha: event.candidateCommitSha,
+    heldInTaskSetHash: event.heldInTaskSetHash,
+    candidateRationaleHash: event.candidateRationaleHash,
+    evidenceRefs: event.evidenceRefs,
+    predictedFixes: event.predictedFixes,
+    riskTasks: event.riskTasks,
+    unexpectedHeldInFlips: event.unexpectedHeldInFlips,
+    decision: event.decision,
+    rootCauseSignalMatch: event.rootCauseSignalMatch,
+  };
+  if (!isDeepStrictEqual(actual, expected)) {
+    throw new Error(`RSI WAL replay attribution mismatch for ${event.roundId}`);
   }
 }
