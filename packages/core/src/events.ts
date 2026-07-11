@@ -205,6 +205,7 @@ export type ToolResultContent =
       failureMessage?: string;
       stdout: string;
       stderr: string;
+      latestOutputStream?: 'stdout' | 'stderr';
       stdoutTruncated: boolean;
       stderrTruncated: boolean;
       timeoutMs?: number;

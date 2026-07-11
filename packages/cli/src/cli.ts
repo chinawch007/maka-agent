@@ -125,6 +125,8 @@ export async function runMakaCli(argv: string[] = process.argv.slice(2)): Promis
           connectionSlug: context.target.connection.slug,
           providerType: context.target.connection.providerType,
           permissionMode: 'ask',
+          subscribeShellRunUpdates: context.subscribeShellRunUpdates,
+          readShellRun: context.readShellRun,
           onProcessExit: handleMakaCliProcessExit,
         });
         return 0;

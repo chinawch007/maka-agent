@@ -108,8 +108,8 @@ describe('builtin Bash streaming output', () => {
           stderrTruncated: false,
         };
       },
-      async readResource(sessionId: string, ref: string) {
-        return { content: `session=${sessionId} ref=${ref}` };
+      async readResource() {
+        throw new Error('not used');
       },
       async stopResource() {
         throw new Error('not used');
@@ -150,7 +150,12 @@ describe('builtin Bash streaming output', () => {
       },
       async readResource(sessionId: string, ref: string) {
         calls.push({ sessionId, ref });
-        return { content: 'background task detail' };
+        return {
+          kind: 'shell_run', ref, status: 'running', cwd: '/workspace',
+          cmd: 'sleep 60', startedAt: 1, updatedAt: 2,
+          stdout: 'background task detail', stderr: '',
+          stdoutTruncated: false, stderrTruncated: false,
+        };
       },
       async stopResource() {
         throw new Error('not used');
@@ -172,7 +177,12 @@ describe('builtin Bash streaming output', () => {
       },
     );
 
-    expect(result).toEqual({ content: 'background task detail' });
+    expect(result).toEqual({
+      kind: 'shell_run', ref: 'maka://runtime/background-tasks/shell-run-1',
+      status: 'running', cwd: '/workspace', cmd: 'sleep 60',
+      startedAt: 1, updatedAt: 2, stdout: 'background task detail', stderr: '',
+      stdoutTruncated: false, stderrTruncated: false,
+    });
     expect(calls).toEqual([{
       sessionId: 'session-1',
       ref: 'maka://runtime/background-tasks/shell-run-1',

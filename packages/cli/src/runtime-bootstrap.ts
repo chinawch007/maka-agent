@@ -20,6 +20,7 @@ import {
   loadHistoryCompactBlocksFromArtifacts,
   persistHistoryCompactBlocksToArtifacts,
   type AutomationDefinition,
+  type ShellRunUpdate,
 } from '@maka/runtime';
 import {
   createAgentRunStore,
@@ -32,6 +33,7 @@ import {
   createSettingsStore,
   createShellRunStore,
 } from '@maka/storage';
+import type { ToolResultContent } from '@maka/core/events';
 import type { ModelChoice, ReadySessionTarget } from './connection-target.js';
 import { listReadyModelChoices, resolveDefaultSessionTarget, resolveSessionTargetForSlug } from './connection-target.js';
 import { buildCliSystemPrompt, buildCliTurnTailPrompt } from './cli-system-prompt.js';
@@ -46,6 +48,11 @@ export interface MakaCliRuntimeContext {
   tools: ReturnType<typeof buildBuiltinTools>;
   automationManager: AutomationManager;
   automationScheduler: AutomationScheduler;
+  subscribeShellRunUpdates(listener: (update: ShellRunUpdate) => void): () => void;
+  readShellRun(sessionId: string, ref: string): Promise<{
+    ownerSessionId: string;
+    result: Extract<ToolResultContent, { kind: 'shell_run' }>;
+  }>;
   close(): Promise<void>;
 }
 
@@ -91,10 +98,20 @@ export async function createMakaCliRuntimeContext(
   const modelChoices = await listReadyModelChoices({ connectionStore, credentialStore });
   const permissionEngine = new PermissionEngine({ newId: randomUUID, now: Date.now });
   const backends = new BackendRegistry();
+  const shellRunListeners = new Set<(update: ShellRunUpdate) => void>();
   const shellRuns = new ShellRunProcessManager({
     store: shellRunStore,
     newId: randomUUID,
     now: Date.now,
+    onShellRunUpdate: (update) => {
+      for (const listener of shellRunListeners) {
+        try {
+          listener(update);
+        } catch {
+          // One UI observer must not suppress updates for the rest.
+        }
+      }
+    },
   });
   const tools = buildBuiltinTools({ shellRuns });
   const automationManager = new AutomationManager({
@@ -257,6 +274,25 @@ export async function createMakaCliRuntimeContext(
 
   automationScheduler.start();
 
+  const readShellRun = async (sessionId: string, ref: string) => {
+    let ownerSessionId: string | undefined = sessionId;
+    const visited = new Set<string>();
+    while (ownerSessionId && !visited.has(ownerSessionId)) {
+      visited.add(ownerSessionId);
+      try {
+        return {
+          ownerSessionId,
+          result: await shellRuns.inspectResource(ownerSessionId, ref),
+        };
+      } catch (error) {
+        if (!isNotFoundError(error)) throw error;
+        ownerSessionId = (await store.readHeader(ownerSessionId)).parentSessionId;
+        if (!ownerSessionId) throw error;
+      }
+    }
+    throw new Error(`Cannot resolve ShellRun owner for session ${sessionId}`);
+  };
+
   return {
     workspaceRoot: input.workspaceRoot,
     cwd: input.cwd,
@@ -266,11 +302,17 @@ export async function createMakaCliRuntimeContext(
     tools,
     automationManager,
     automationScheduler,
+    subscribeShellRunUpdates: (listener) => {
+      shellRunListeners.add(listener);
+      return () => shellRunListeners.delete(listener);
+    },
+    readShellRun,
     close: async () => {
       // Stop the automation scheduler's timer (else it keeps the process alive
       // and ticks into a stopped session), then terminate background shell runs.
       automationScheduler.dispose();
       await shellRuns.terminateAll();
+      shellRunListeners.clear();
     },
   };
 }
@@ -315,6 +357,10 @@ function userOptedIntoSemanticCompact(env: Record<string, string | undefined>): 
   }
   const mode = env.MAKA_CONTEXT_SEMANTIC_COMPACT_MODE?.trim().toLowerCase();
   return mode === 'validate_only' || mode === 'prepare_step_dry_run' || mode === 'replace';
+}
+
+function isNotFoundError(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && 'code' in error && error.code === 'ENOENT';
 }
 
 export async function getOrCreateCliClaudeDeviceId(

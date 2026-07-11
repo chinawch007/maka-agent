@@ -61,10 +61,12 @@ export type MakaPiTranscriptEntry =
       result?: ToolResultContent;
       /** Flattened result text, kept as a fallback for text/json/unknown kinds. */
       output?: string;
+      /** In-memory revision for render-cache invalidation when a result is replaced. */
+      resultVersion: number;
       progress: BoundedChunkBuffer<string>;
       outputDeltas: BoundedChunkBuffer<MakaPiToolOutputDelta>;
       durationMs?: number;
-      status: 'running' | 'done' | 'error';
+      status: 'running' | 'done' | 'error' | 'failed' | 'aborted' | 'detached';
     }
   | { kind: 'notice'; level: 'info' | 'error'; text: string };
 
@@ -93,12 +95,64 @@ export function appendUserPrompt(state: MakaPiTranscriptState, text: string): vo
   state.entries.push({ kind: 'user', text });
 }
 
+export function refreshRunningShellRunElapsed(
+  state: MakaPiTranscriptState,
+  now = Date.now(),
+): boolean {
+  let found = false;
+  for (const entry of state.entries) {
+    if (entry.kind !== 'tool' || entry.status !== 'running' || entry.result?.kind !== 'shell_run') continue;
+    entry.durationMs = Math.max(0, now - entry.result.startedAt);
+    found = true;
+  }
+  return found;
+}
+
+export function runningShellRunsInTranscript(
+  state: MakaPiTranscriptState,
+): Array<{ sourceToolCallId: string; ref: string }> {
+  return state.entries.flatMap((entry) => entry.kind === 'tool'
+    && entry.toolName === 'Bash'
+    && entry.status === 'running'
+    && entry.result?.kind === 'shell_run'
+    && entry.result.status === 'running'
+    ? [{ sourceToolCallId: entry.toolUseId, ref: entry.result.ref }]
+    : []);
+}
+
+export function applyDetachedShellRunToTranscript(
+  state: MakaPiTranscriptState,
+  sourceToolCallId: string,
+  update: Extract<ToolResultContent, { kind: 'shell_run' }>,
+): boolean {
+  const applied = applyShellRunUpdateToTranscript(state, sourceToolCallId, update);
+  const tool = findToolEntry(state, sourceToolCallId);
+  if (!tool
+    || tool.toolName !== 'Bash'
+    || tool.result?.kind !== 'shell_run'
+    || tool.result.ref !== update.ref
+    || tool.result.status !== 'running') return applied;
+  tool.status = 'detached';
+  return true;
+}
+
+export function applyShellRunUpdateToTranscript(
+  state: MakaPiTranscriptState,
+  sourceToolCallId: string,
+  update: Extract<ToolResultContent, { kind: 'shell_run' }>,
+): boolean {
+  const tool = findToolEntry(state, sourceToolCallId);
+  if (!tool || tool.toolName !== 'Bash') return false;
+  if (tool.result?.kind === 'shell_run' && tool.result.ref !== update.ref) return false;
+  return applyShellRunResult(tool, update);
+}
+
 export function replaceTranscriptWithStoredMessages(
   state: MakaPiTranscriptState,
   messages: readonly StoredMessage[],
 ): void {
   const view = materializeSession(messages);
-  state.entries = view.items.flatMap(chatItemToTranscriptEntries);
+  state.entries = foldStoredShellRunChildren(view.items.flatMap(chatItemToTranscriptEntries));
   state.sawTextDeltaMessageIds = new Set(
     state.entries
       .filter((entry): entry is Extract<MakaPiTranscriptEntry, { kind: 'assistant' }> => entry.kind === 'assistant')
@@ -222,6 +276,7 @@ export function applyMakaSessionEventToTranscript(
         toolName: event.toolName,
         ...(event.displayName ? { title: event.displayName } : {}),
         input: event.args,
+        resultVersion: 0,
         progress: createProgressBuffer(),
         outputDeltas: createOutputBuffer(),
         status: 'running',
@@ -230,11 +285,25 @@ export function applyMakaSessionEventToTranscript(
 
     case 'tool_result': {
       const tool = findToolEntry(state, event.toolUseId);
+      const shellRun = event.content.kind === 'shell_run' ? event.content : undefined;
+      const parent = shellRun
+        ? findShellRunParent(state, shellRun.ref, event.toolUseId)
+        : undefined;
+      if (tool && parent && shellRun) {
+        applyShellRunResult(parent, shellRun);
+        state.entries.splice(state.entries.indexOf(tool), 1);
+        break;
+      }
       if (tool) {
-        tool.status = event.isError ? 'error' : 'done';
-        tool.result = event.content;
-        tool.output = formatToolResultContent(event.content);
-        tool.durationMs = event.durationMs;
+        if (shellRun) {
+          applyShellRunResult(tool, shellRun);
+        } else {
+          tool.status = event.isError ? 'error' : 'done';
+          tool.result = event.content;
+          tool.output = formatToolResultContent(event.content);
+          tool.durationMs = event.durationMs;
+          tool.resultVersion += 1;
+        }
       } else {
         state.entries.push({
           kind: 'tool',
@@ -245,6 +314,7 @@ export function applyMakaSessionEventToTranscript(
           outputDeltas: createOutputBuffer(),
           result: event.content,
           output: formatToolResultContent(event.content),
+          resultVersion: 1,
           durationMs: event.durationMs,
           status: event.isError ? 'error' : 'done',
         });
@@ -369,13 +439,13 @@ function chatItemToTranscriptEntries(item: ChatItem): MakaPiTranscriptEntry[] {
   }
 }
 
-function toolActivityToTranscriptEntry(item: ToolActivityItem): MakaPiTranscriptEntry {
+function toolActivityToTranscriptEntry(item: ToolActivityItem): MakaPiToolEntry {
   const output = item.result
     ? formatToolResultContent(item.result)
     : item.status === 'interrupted'
       ? 'Interrupted before the tool returned a result.'
       : undefined;
-  return {
+  const entry: MakaPiToolEntry = {
     kind: 'tool',
     toolUseId: item.toolUseId,
     toolName: item.toolName,
@@ -385,9 +455,33 @@ function toolActivityToTranscriptEntry(item: ToolActivityItem): MakaPiTranscript
     outputDeltas: createOutputBuffer(),
     ...(item.result ? { result: item.result } : {}),
     ...(output ? { output } : {}),
+    resultVersion: item.result ? 1 : 0,
     ...(item.durationMs !== undefined ? { durationMs: item.durationMs } : {}),
     status: transcriptToolStatus(item.status),
   };
+  if (item.result?.kind === 'shell_run') applyShellRunResult(entry, item.result);
+  return entry;
+}
+
+function foldStoredShellRunChildren(entries: MakaPiTranscriptEntry[]): MakaPiTranscriptEntry[] {
+  const folded: MakaPiTranscriptEntry[] = [];
+  for (const entry of entries) {
+    if (entry.kind === 'tool' && entry.result?.kind === 'shell_run') {
+      const shellRun = entry.result;
+      const parent = [...folded]
+        .reverse()
+        .find((candidate): candidate is MakaPiToolEntry => candidate.kind === 'tool'
+          && candidate.toolName === 'Bash'
+          && candidate.result?.kind === 'shell_run'
+          && candidate.result.ref === shellRun.ref);
+      if (parent) {
+        applyShellRunResult(parent, shellRun);
+        continue;
+      }
+    }
+    folded.push(entry);
+  }
+  return folded;
 }
 
 function transcriptToolStatus(status: ToolActivityItem['status']): MakaPiToolEntry['status'] {
@@ -402,6 +496,47 @@ function transcriptToolStatus(status: ToolActivityItem['status']): MakaPiToolEnt
     case 'running':
       return 'running';
   }
+}
+
+function shellRunTranscriptStatus(
+  status: Extract<ToolResultContent, { kind: 'shell_run' }>['status'],
+): MakaPiToolEntry['status'] {
+  switch (status) {
+    case 'running':
+      return 'running';
+    case 'completed':
+      return 'done';
+    case 'cancelled':
+      return 'aborted';
+    case 'failed':
+    case 'timed_out':
+    case 'orphaned':
+      return 'failed';
+  }
+}
+
+function applyShellRunResult(
+  entry: MakaPiToolEntry,
+  result: Extract<ToolResultContent, { kind: 'shell_run' }>,
+): boolean {
+  if (entry.result?.kind === 'shell_run' && shellRunUpdateIsStale(entry.result, result)) return false;
+  entry.status = shellRunTranscriptStatus(result.status);
+  entry.result = result;
+  entry.output = formatToolResultContent(result);
+  entry.durationMs = Math.max(0, (result.completedAt ?? result.updatedAt) - result.startedAt);
+  entry.resultVersion += 1;
+  return true;
+}
+
+function shellRunUpdateIsStale(
+  current: Extract<ToolResultContent, { kind: 'shell_run' }>,
+  next: Extract<ToolResultContent, { kind: 'shell_run' }>,
+): boolean {
+  if (current.updatedAt !== next.updatedAt) return current.updatedAt > next.updatedAt;
+  if (current.status !== 'running' || next.status !== 'running') {
+    return current.status !== 'running' && next.status === 'running';
+  }
+  return current.stdout.length + current.stderr.length > next.stdout.length + next.stderr.length;
 }
 
 function systemNoteToTranscriptEntry(message: SystemNoteMessage): MakaPiTranscriptEntry | undefined {
@@ -576,10 +711,10 @@ function transcriptEntrySignature(
     case 'notice':
       return `notice|${width}|${entry.level}|${entry.text.length}`;
     case 'tool':
-      // A tool entry mutates in place as it runs: status/duration flip on the
-      // result, and progress/output deltas append while running. Its result
-      // object is set once and never rewritten, so counting these fields is
-      // enough to detect every change to the rendered block. `input` and
+      // A tool entry mutates in place as it runs: status/duration flip,
+      // progress/output deltas append, and resultVersion advances whenever a
+      // result is accepted. Count those revisions instead of duplicating the
+      // result's rendering contract in this cache key. `input` and
       // `toolName` are omitted deliberately: both are set once at `tool_start`,
       // before the first render, and never change, so they can't go stale.
       return [
@@ -591,8 +726,7 @@ function transcriptEntrySignature(
         entry.title ?? entry.toolName,
         entry.progress.version,
         entry.outputDeltas.version,
-        entry.output?.length ?? '',
-        entry.result ? entry.result.kind : '',
+        entry.resultVersion,
       ].join('|');
   }
 }
@@ -676,6 +810,20 @@ function createOutputBuffer(): BoundedChunkBuffer<MakaPiToolOutputDelta> {
     withText: (delta, chunk) => ({ ...delta, chunk }),
     sequence: (delta) => delta.seq,
   });
+}
+
+function findShellRunParent(
+  state: MakaPiTranscriptState,
+  ref: string,
+  childToolUseId: string,
+): MakaPiToolEntry | undefined {
+  return [...state.entries]
+    .reverse()
+    .find((entry): entry is MakaPiToolEntry => entry.kind === 'tool'
+      && entry.toolName === 'Bash'
+      && entry.toolUseId !== childToolUseId
+      && entry.result?.kind === 'shell_run'
+      && entry.result.ref === ref);
 }
 
 function renderTextBlock(

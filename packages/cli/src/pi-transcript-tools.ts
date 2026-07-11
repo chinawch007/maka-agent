@@ -20,10 +20,16 @@ export function renderToolBlock(entry: MakaPiToolEntry, width: number, expanded:
 function toolStatusText(entry: MakaPiToolEntry): string {
   const status = entry.status === 'running'
     ? ansi.yellow('running')
-    : entry.status === 'error'
-      ? ansi.red('error')
-      : ansi.green('done');
-  const duration = entry.durationMs === undefined ? '' : ansi.dim(` ${entry.durationMs}ms`);
+    : entry.status === 'detached'
+      ? ansi.dim('detached')
+      : entry.status === 'done'
+        ? ansi.green('done')
+        : ansi.red(entry.status);
+  const duration = entry.durationMs === undefined
+    ? ''
+    : entry.result?.kind === 'shell_run'
+      ? ansi.dim(` ${Math.floor(entry.durationMs / 1_000)}s`)
+      : ansi.dim(` ${entry.durationMs}ms`);
   return `${status}${duration}`;
 }
 
@@ -43,6 +49,9 @@ function renderCompactToolBlock(entry: MakaPiToolEntry, width: number): string[]
   if (summary) {
     const hint = summary.expandable ? ansi.dim(' (Ctrl+O)') : '';
     lines.push(fitLine(`  ${collapseToSingleLine(summary.text)}${hint}`, width));
+  }
+  if (entry.status === 'running' && entry.result?.kind === 'shell_run') {
+    lines.push(fitLine(ansi.dim('  Ask Maka to stop this task'), width));
   }
   return lines;
 }
@@ -74,6 +83,9 @@ function renderExpandedToolBlock(entry: MakaPiToolEntry, width: number): string[
   if (entry.result || entry.output) {
     lines.push(...renderToolResult(entry, width));
   }
+  if (entry.status === 'running' && entry.result?.kind === 'shell_run') {
+    lines.push(...renderIndented(ansi.dim('Ask Maka to stop this task'), width, 2));
+  }
   return lines.map((line) => fitLine(line, width));
 }
 
@@ -85,12 +97,26 @@ interface CompactToolSummary {
 
 function compactToolSummary(entry: MakaPiToolEntry, width: number): CompactToolSummary | undefined {
   const hasLiveOutput = entry.outputDeltas.length > 0 || entry.progress.length > 0;
+  const result = entry.result;
+  if (result?.kind === 'shell_run') {
+    const latest = result.latestOutputStream
+      ? lastNonEmptyLine(result[result.latestOutputStream])
+      : lastNonEmptyLine([result.stdout, result.stderr].filter(Boolean).join('\n'));
+    if (latest) return { text: latest, expandable: true };
+    return {
+      text: entry.status === 'detached'
+        ? ansi.dim('(owned by source session)')
+        : result.status === 'running'
+          ? ansi.dim('(waiting for output)')
+          : ansi.dim('(no output)'),
+      expandable: true,
+    };
+  }
   if (entry.status === 'running' && hasLiveOutput) {
     const live = latestLiveOutputLine(entry);
     if (live) return { text: live, expandable: true };
   }
 
-  const result = entry.result;
   if (result?.kind === 'terminal') return compactTerminalSummary(result, hasLiveOutput);
   if (result?.kind === 'file_diff') return compactDiffSummary(result);
   if (result?.kind === 'file_write') {
