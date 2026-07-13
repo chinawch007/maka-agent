@@ -15,7 +15,7 @@ dist/**/*.test.js). Real finds verified by hand before acting.
 
 ## Rounds
 
-- [ ] **A — Safe deletions + dependency hygiene + knip governance**
+- [x] **A — SHIPPED (b2a1afd6): knip governance + dead code + dep hygiene.** 6 symbols deleted, 1 demoted, dev-hmr.mjs removed; @base-ui/react→deps, streamdown→devDeps (test-only; deviation on correctness), overlayscrollbars NOT declared (overlay-scrollbars contract forbids it — knip ignoreDependencies instead); scroll-area.tsx retained (a contract reads its content — follow-up: remove file+test together); knip.json (entries per workspace, ignoreExportsUsedInFile, -knipignore tag) + 2 CI steps in the typecheck job; ignore reasons documented below. Gates: desktop 2397/2397, ui 125/125, typecheck, 4 static checks, auditor — all identical before/after.
   - Delete packages/ui/src/primitives/scroll-area.tsx (orphaned by overlay-scroll-area)
   - ~40 unused exports/types across desktop main+renderer and packages/ui — for each:
     grep __tests__ first (contract tests read source text; some pins assert the export
