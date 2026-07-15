@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,11 +9,32 @@ const repoRoot = join(here, '..');
 const harnessPath = join(here, 'cu-real-ax-model-e2e.mjs');
 const monitorPath = join(here, 'cu-real-e2e-monitor.swift');
 const inputAgeSource = join(here, 'cu-physical-input-age.swift');
-const labRoot = '/Users/haoqing/Documents/Learning/codex-computer-use-lab';
+const labRoot = process.env.MAKA_CU_AX_MODEL_LAB_ROOT
+  ?? '/Users/haoqing/Documents/Learning/codex-computer-use-lab';
 const statePath = join(labRoot, 'test-app/runtime/state.json');
 const fixtureBundleId = 'com.openai.codex.cualab';
 const expectedAppPath = join(labRoot, 'test-app/build/Codex CUA Lab.app');
 const scenario = process.env.MAKA_CU_AX_MODEL_SCENARIO ?? 'set-value';
+const reportPath = process.env.MAKA_CU_AX_MODEL_REPORT
+  ?? join(
+    repoRoot,
+    '.agents-workspace-data',
+    'cu-real-ax-model',
+    `report-${Date.now()}.json`,
+  );
+const driverOverride = process.env.MAKA_CU_AX_MODEL_DRIVER_OVERRIDE;
+const overrideSha256 = process.env.MAKA_CU_AX_MODEL_EXPECTED_SHA256;
+const overrideVersion = process.env.MAKA_CU_AX_MODEL_EXPECTED_VERSION;
+const overrideConfigured = [driverOverride, overrideSha256, overrideVersion]
+  .filter(Boolean).length;
+if (overrideConfigured !== 0 && overrideConfigured !== 3) {
+  throw new Error(
+    'candidate driver qualification requires override path, expected SHA-256, and expected version',
+  );
+}
+if (overrideSha256 && !/^[a-f0-9]{64}$/.test(overrideSha256)) {
+  throw new Error('candidate driver expected SHA-256 is invalid');
+}
 const delay = (milliseconds) =>
   new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -145,7 +166,9 @@ function startMonitor(fixturePID) {
           mode: fields[0],
           frontmostPID: Number(fields[1]),
           pointer: { x: Number(fields[2]), y: Number(fields[3]) },
-          bundleIdentifier: fields[4],
+          physicalInputAge: Number(fields[4]),
+          bundleIdentifier: fields[5],
+          canonicalAppPath: fields[6],
         });
       } else if (kind === 'CHANGE' || kind === 'ERROR') {
         fail(new Error(fields.join('\t') || line));
@@ -171,6 +194,24 @@ function startMonitor(fixturePID) {
   };
 }
 
+function validateMonitorBaseline(baseline, fixturePID, label) {
+  if (baseline.mode !== 'concurrent_user') {
+    throw new Error(`${label} reported unexpected mode '${String(baseline.mode)}'`);
+  }
+  if (!Number.isFinite(baseline.physicalInputAge) || baseline.physicalInputAge < 0) {
+    throw new Error(`${label} reported invalid physical input age`);
+  }
+  if (baseline.bundleIdentifier !== fixtureBundleId) {
+    throw new Error(`${label} fixture bundle identity mismatch`);
+  }
+  if (baseline.canonicalAppPath !== expectedAppPath) {
+    throw new Error(`${label} fixture app path mismatch`);
+  }
+  if (baseline.frontmostPID === fixturePID) {
+    throw new Error(`${label} synthetic fixture became frontmost`);
+  }
+}
+
 async function run() {
   const temporaryDirectory = await mkdtemp(join(tmpdir(), 'maka-cu-real-ax-model-'));
   const inputAgePath = join(temporaryDirectory, 'cu-physical-input-age');
@@ -179,6 +220,7 @@ async function run() {
   let monitor;
   let harness;
   try {
+    await mkdir(dirname(reportPath), { recursive: true });
     caffeinate = spawn('/usr/bin/caffeinate', ['-dimsu'], {
       stdio: ['ignore', 'ignore', 'inherit'],
     });
@@ -189,6 +231,12 @@ async function run() {
     }
     await runChild('npm', ['run', 'prepare:cua-driver'], { cwd: repoRoot });
     await runChild('npm', ['run', 'check:cua-driver-artifact'], { cwd: repoRoot });
+    if (driverOverride) {
+      await copyFile(
+        driverOverride,
+        join(repoRoot, 'apps/desktop/resources/bin/cua-driver'),
+      );
+    }
     await runChild('swiftc', [inputAgeSource, '-o', inputAgePath], {
       stdio: ['ignore', 'ignore', 'inherit'],
     });
@@ -206,17 +254,27 @@ async function run() {
         throw new Error('AX model safety monitor startup timeout');
       }),
     ]);
-    if (baseline.frontmostPID === fixture.oop.hostPID) {
-      throw new Error('synthetic fixture became frontmost before model execution');
-    }
+    validateMonitorBaseline(
+      baseline,
+      fixture.oop.hostPID,
+      'AX model safety monitor',
+    );
     harness = spawn(process.execPath, [harnessPath], {
       cwd: repoRoot,
       env: {
         ...process.env,
         MAKA_CU_AX_MODEL_FIXTURE_PID: String(fixture.oop.hostPID),
         MAKA_CU_AX_MODEL_INPUT_AGE_PROBE: inputAgePath,
+        MAKA_CU_AX_MODEL_LAB_ROOT: labRoot,
         MAKA_CU_AX_MODEL_TEMP_DIR: temporaryDirectory,
         MAKA_CU_AX_MODEL_SCENARIO: scenario,
+        MAKA_CU_AX_MODEL_REPORT: reportPath,
+        ...(overrideSha256
+          ? { MAKA_CU_AX_MODEL_EXPECTED_SHA256: overrideSha256 }
+          : {}),
+        ...(overrideVersion
+          ? { MAKA_CU_AX_MODEL_EXPECTED_VERSION: overrideVersion }
+          : {}),
       },
       stdio: ['ignore', 'inherit', 'inherit'],
     });
@@ -254,9 +312,11 @@ async function run() {
           throw new Error('restarted AX model safety monitor timeout');
         }),
       ]);
-      if (restartedBaseline.frontmostPID === restarted.oop.hostPID) {
-        throw new Error('restarted synthetic fixture became frontmost');
-      }
+      validateMonitorBaseline(
+        restartedBaseline,
+        restarted.oop.hostPID,
+        'restarted AX model safety monitor',
+      );
       await runChild(process.execPath, [
         '-e',
         "require('fs').writeFileSync(process.argv[1], process.argv[2], {flag:'wx',mode:0o600})",
@@ -278,6 +338,8 @@ async function run() {
     if (first.result.code !== 0) {
       throw new Error(`AX model E2E failed (${first.result.signal ?? first.result.code})`);
     }
+    await readFile(reportPath, 'utf8');
+    process.stdout.write(`Real AX model Computer Use report: ${reportPath}\n`);
   } finally {
     await terminateChild(harness, 'AX model harness').catch(() => {});
     await monitor?.stop().catch(() => {});

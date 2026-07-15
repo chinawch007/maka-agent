@@ -5,8 +5,25 @@ import { pathToFileURL } from 'node:url';
 const READINESS = new Set(['real', 'contract', 'unsupported']);
 const EVIDENCE_CLASSES = new Set([
   'real-runtime',
+  'fault-injection',
   'hermetic-protocol',
   'static-contract',
+]);
+const REAL_REPORT_PRODUCERS = new Set([
+  'cu-real-model-launcher',
+  'cu-real-ax-model-e2e',
+]);
+const ACTIONS_WITHOUT_TARGET_OWNERSHIP = new Set([
+  'list_apps',
+  'wait',
+  'cursor_position',
+]);
+const ACTIONS_WITHOUT_OBSERVATION_LINEAGE = new Set([
+  'list_apps',
+  'observe',
+  'screenshot',
+  'wait',
+  'cursor_position',
 ]);
 
 function optionValue(argv, names) {
@@ -256,30 +273,81 @@ export function normalizeReport(report, scenario) {
   };
 }
 
-function validateRealReport(report, provider, scenario) {
+export function validateRealReport(report, provider, scenario) {
   const errors = [];
   if (report.schemaVersion !== 1) errors.push('schemaVersion must be 1');
+  if (typeof report.runId !== 'string' || !report.runId) errors.push('runId missing');
+  if (typeof report.gitRevision !== 'string' || !/^[a-f0-9]{40}$/.test(report.gitRevision)) {
+    errors.push('gitRevision missing or invalid');
+  }
+  const generatedAt = Date.parse(report.generatedAt);
+  if (
+    typeof report.generatedAt !== 'string'
+    || !Number.isFinite(generatedAt)
+    || new Date(generatedAt).toISOString() !== report.generatedAt
+  ) errors.push('generatedAt missing or invalid');
+  if (
+    report.contentLineage?.generator !== `scripts/${report.producer === 'cu-real-model-launcher'
+      ? 'cu-real-model-launcher.mjs'
+      : 'cu-real-ax-model-e2e.mjs'}`
+    || report.contentLineage?.gitRevision !== report.gitRevision
+    || report.contentLineage?.generatedAt !== report.generatedAt
+  ) errors.push('contentLineage mismatch');
   if (report.evidenceClass !== 'real-runtime') errors.push('evidenceClass must be real-runtime');
   if (report.scenarioId !== scenario.id) errors.push('scenarioId mismatch');
   if (report.status !== 'pass') errors.push('report status must be pass');
   if (report.transportClass !== 'live-network') errors.push('transportClass must be live-network');
-  if (typeof report.producer !== 'string' || !report.producer) errors.push('producer missing');
+  if (!REAL_REPORT_PRODUCERS.has(report.producer)) errors.push('producer missing or unknown');
+  const expectedProducer = select(provider.producer, scenario.id);
+  if (report.producer !== expectedProducer) errors.push('producer mismatch');
+  if (report.policyMode !== 'enforced' && report.policyMode !== 'bypassed') {
+    errors.push('policyMode missing or unknown');
+  }
+  if (report.qualificationEligible !== true) errors.push('qualificationEligible must be true');
+  if (report.deprecated === true) errors.push('deprecated reports cannot qualify');
   if (report.provider !== provider.id) errors.push('provider mismatch');
   const expectedModel = select(provider.model ?? provider.modelId, scenario.id);
-  if (expectedModel && report.model !== expectedModel) errors.push('model mismatch');
+  if (typeof expectedModel !== 'string' || !expectedModel) errors.push('expected model missing');
+  else if (report.model !== expectedModel) errors.push('model mismatch');
   if (
     report.terminal?.type !== 'complete'
     || report.terminal?.stopReason !== 'end_turn'
   ) errors.push('terminal must be complete/end_turn');
   const actions = Array.isArray(report.actions) ? report.actions : [];
+  const ledgerCounts = actionCounts(actions);
+  if (report.actionAttempts !== actions.length) errors.push('actionAttempts mismatch');
   if (report.actionCount !== actions.length) errors.push('actionCount mismatch');
+  if (!deepSubsetEqual(report.actionCounts, ledgerCounts)
+    || Object.keys(report.actionCounts ?? {}).length !== Object.keys(ledgerCounts).length) {
+    errors.push('actionCounts mismatch');
+  }
   if (report.minimumActionsPassed !== true) errors.push('minimumActionsPassed must be true');
   if (report.actionsWithinBudget !== true) errors.push('actionsWithinBudget must be true');
   if (actions.some((action) =>
-    action.success !== true
-    || action.targetOwned !== true
-    || !scenario.allowedActions.includes(action.type))) {
-    errors.push('actions must be successful, owned, and allowed');
+    !scenario.allowedActions.includes(action.type)
+    || !actionResultAllowed(action, scenario))) {
+    errors.push('actions must be successful or scenario-authorized expected failures, and allowed');
+  }
+  if (actions.some((action) =>
+    !ACTIONS_WITHOUT_TARGET_OWNERSHIP.has(action.type)
+    && !actionHasOwnedFixtureTrace(action, report.fixtureIdentity))) {
+    errors.push('target ownership requires fixture PID/window trace evidence');
+  }
+  if (!actionLineageValid(actions)) {
+    errors.push('action observation lineage is incomplete or out of order');
+  }
+  if (
+    scenario.expectedFailures?.some((expected) =>
+      expected.action === 'set_value' && expected.error === 'target_missing')
+    && !restartRecoveryValid(actions, report.driverTraces)
+  ) {
+    errors.push('restart recovery requires target_missing, fresh observation, and successful AX retry');
+  }
+  if (
+    Array.isArray(scenario.expectedActionSequence)
+    && !deepSubsetEqual(actions.map((action) => action.type), scenario.expectedActionSequence)
+  ) {
+    errors.push('action sequence mismatch');
   }
   if (
     Number.isInteger(scenario.maxTotalActions)
@@ -296,16 +364,121 @@ function validateRealReport(report, provider, scenario) {
     }
   }
   const mutationActions = actions.filter((action) =>
-    !['list_apps', 'observe', 'screenshot', 'cursor_position', 'wait'].includes(action.type));
+    action.success === true
+    && !['list_apps', 'observe', 'screenshot', 'cursor_position', 'wait'].includes(action.type));
   if (mutationActions.length > 0) {
-    const safeDispatch = Array.isArray(report.driverTraces)
-      && report.driverTraces.some((trace) =>
-        trace.type === 'dispatch'
+    const traces = Array.isArray(report.driverTraces) ? report.driverTraces : [];
+    const consumed = new Set();
+    const missingDispatch = mutationActions.find((action) => {
+      const index = traces.findIndex((trace, traceIndex) =>
+        !consumed.has(traceIndex)
+        && trace.type === 'dispatch'
+        && trace.toolCallId === action.toolCallId
+        && trace.actionType === action.type
+        && trace.pid === action.targetPid
+        && trace.windowId === action.targetWindowId
         && (trace.address === 'ax' || trace.address === 'semantic'));
-    if (!safeDispatch) errors.push('safe dispatch evidence missing');
+      if (index < 0) return true;
+      consumed.add(index);
+      return false;
+    });
+    if (missingDispatch) {
+      errors.push(`safe dispatch evidence missing for ${missingDispatch.type}`);
+    }
     if (report.dispatchPathPassed !== true) errors.push('dispatchPathPassed must be true');
   }
   return errors;
+}
+
+function actionCounts(actions) {
+  const counts = {};
+  for (const action of actions) {
+    const type = typeof action?.type === 'string' ? action.type : 'unknown';
+    counts[type] = (counts[type] ?? 0) + 1;
+  }
+  return counts;
+}
+
+function restartRecoveryValid(actions, traces) {
+  const staleIndex = actions.findIndex((action) =>
+    action.type === 'set_value'
+    && action.success === false
+    && action.expectedFailure === true
+    && action.resultCode === 'target_missing');
+  if (staleIndex < 0) return false;
+  const stale = actions[staleIndex];
+  const freshIndex = actions.findIndex((action, index) =>
+    index > staleIndex
+    && action.type === 'observe'
+    && action.success === true
+    && typeof action.resultObservationId === 'string'
+    && (
+      action.targetPid !== stale.targetPid
+      || action.targetWindowId !== stale.targetWindowId
+    ));
+  if (freshIndex < 0) return false;
+  const fresh = actions[freshIndex];
+  const retry = actions.find((action, index) =>
+    index > freshIndex
+    && action.type === 'set_value'
+    && action.success === true
+    && action.sourceObservationId === fresh.resultObservationId
+    && action.targetPid === fresh.targetPid
+    && action.targetWindowId === fresh.targetWindowId);
+  if (!retry) return false;
+  return Array.isArray(traces) && traces.some((trace) =>
+    trace.type === 'dispatch'
+    && trace.toolCallId === retry.toolCallId
+    && trace.actionType === 'set_value'
+    && trace.pid === retry.targetPid
+    && trace.windowId === retry.targetWindowId
+    && trace.address === 'ax');
+}
+
+function actionHasOwnedFixtureTrace(action, fixtureIdentity) {
+  return action.targetOwned === true
+    && Array.isArray(fixtureIdentity?.instances)
+    && fixtureIdentity.instances.some((instance) =>
+      action.targetPid === instance.pid
+      && Array.isArray(instance.windowIds)
+      && instance.windowIds.includes(action.targetWindowId));
+}
+
+function actionResultAllowed(action, scenario) {
+  if (action.success === true) return true;
+  if (action.expectedFailure !== true || typeof action.resultCode !== 'string') return false;
+  return Array.isArray(scenario.expectedFailures)
+    && scenario.expectedFailures.some((expected) =>
+      expected.action === action.type && expected.error === action.resultCode);
+}
+
+function actionLineageValid(actions) {
+  let latestObservationId;
+  let latestTarget;
+  for (const action of actions) {
+    if (
+      !ACTIONS_WITHOUT_OBSERVATION_LINEAGE.has(action.type)
+      && (
+        typeof action.sourceObservationId !== 'string'
+        || action.sourceObservationId !== latestObservationId
+        || action.targetPid !== latestTarget?.pid
+        || action.targetWindowId !== latestTarget?.windowId
+      )
+    ) {
+      return false;
+    }
+    if (typeof action.resultObservationId === 'string') {
+      latestObservationId = action.resultObservationId;
+      latestTarget = { pid: action.targetPid, windowId: action.targetWindowId };
+    } else if (action.type === 'observe') {
+      return false;
+    }
+    if (action.expectedFailure === true && action.resultCode === 'target_missing') {
+      latestObservationId = undefined;
+      latestTarget = undefined;
+    }
+  }
+  return true;
 }
 
 function rowStatus(readiness, report, metrics) {
@@ -367,6 +540,18 @@ export async function buildProviderMatrix({
       if (!READINESS.has(readiness)) {
         throw new Error(
           `provider ${provider.id} scenario ${scenario.id} has invalid readiness ${JSON.stringify(readiness)}`,
+        );
+      }
+      const producer = select(provider.producer, scenario.id);
+      if (readiness === 'real' && !REAL_REPORT_PRODUCERS.has(producer)) {
+        throw new Error(
+          `provider ${provider.id} scenario ${scenario.id} real readiness requires an explicit known producer`,
+        );
+      }
+      const model = select(provider.model ?? provider.modelId, scenario.id);
+      if (readiness === 'real' && (typeof model !== 'string' || !model)) {
+        throw new Error(
+          `provider ${provider.id} scenario ${scenario.id} real readiness requires an explicit model`,
         );
       }
       const reportTemplate = reportTemplateFor(provider, scenario);

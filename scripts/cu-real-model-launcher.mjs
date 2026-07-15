@@ -1,5 +1,7 @@
 import { _electron as electron, chromium } from '@playwright/test';
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { promisify } from 'node:util';
 import {
   cp,
   mkdir,
@@ -10,12 +12,13 @@ import {
 } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   evaluateCuE2eScenarioState,
   getCuE2eScenario,
 } from './cu-e2e-scenarios.mjs';
+import { validateRealReport } from './cu-provider-matrix.mjs';
 import {
   sanitizeCuActionRecord,
   sanitizeCuReport,
@@ -29,6 +32,7 @@ import {
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, '..');
+const execFileAsync = promisify(execFile);
 const sourceWorkspace = join(
   homedir(),
   'Library',
@@ -75,6 +79,24 @@ const reportPath = process.env.MAKA_CU_REAL_MODEL_REPORT
 const runPrompt =
   'Use the maka_computer tool to complete this task. '
   + scenario.prompt;
+
+async function reportLineage() {
+  const { stdout } = await execFileAsync('git', ['rev-parse', 'HEAD'], {
+    cwd: repoRoot,
+  });
+  const generatedAt = new Date().toISOString();
+  const gitRevision = stdout.trim();
+  return {
+    runId: randomUUID(),
+    gitRevision,
+    generatedAt,
+    contentLineage: {
+      generator: 'scripts/cu-real-model-launcher.mjs',
+      gitRevision,
+      generatedAt,
+    },
+  };
+}
 
 async function reservePort() {
   const server = createServer();
@@ -136,10 +158,13 @@ async function waitForLine(child, marker, timeout) {
     const onData = (chunk) => {
       stdout += String(chunk);
       process.stdout.write(chunk);
-      if (stdout.includes(marker)) {
+      const matched = marker === 'CU_FIXTURE_READY'
+        ? /^CU_FIXTURE_READY\s+\d+\s*$/m.test(stdout)
+        : stdout.includes(marker);
+      if (matched) {
         clearTimeout(timer);
         child.stdout.off('data', onData);
-        resolve();
+        resolve(stdout);
       }
     };
     child.stdout.on('data', onData);
@@ -152,17 +177,54 @@ async function waitForLine(child, marker, timeout) {
   });
 }
 
-function parseOwnedTarget(text, fixturePid) {
-  if (typeof text !== 'string') return false;
-  try {
-    const value = JSON.parse(text);
-    return Number(value.pid) === fixturePid;
-  } catch {
-    return false;
+export function parseFixtureReady(text, childPid) {
+  const matches = typeof text === 'string'
+    ? [...text.matchAll(/^CU_FIXTURE_READY\s+(\d+)\s*$/gm)]
+    : [];
+  if (matches.length !== 1) {
+    throw new Error('fixture READY identity is missing or ambiguous');
   }
+  const readyPid = Number(matches[0][1]);
+  if (!Number.isInteger(childPid) || childPid <= 0 || readyPid !== childPid) {
+    throw new Error(
+      `fixture READY pid ${readyPid} does not match launcher child pid ${childPid}`,
+    );
+  }
+  return readyPid;
 }
 
-function actionRecords(events, fixturePid, allowedApps) {
+export function parseTargetEvidence(text) {
+  if (typeof text !== 'string') return undefined;
+  const candidates = [text];
+  for (const markerText of ['Fresh observation:\n', 'Fresh observation: ']) {
+    const marker = text.lastIndexOf(markerText);
+    if (marker >= 0) candidates.push(text.slice(marker + markerText.length));
+  }
+  for (const candidate of candidates.reverse()) {
+    try {
+      const value = JSON.parse(candidate);
+      if (
+        value
+        && typeof value === 'object'
+        && Number.isInteger(value.pid)
+        && Number.isInteger(value.window_id)
+      ) {
+        return {
+          ...(typeof value.observation_id === 'string'
+            ? { observationId: value.observation_id }
+            : {}),
+          pid: value.pid,
+          windowId: value.window_id,
+        };
+      }
+    } catch {
+      // Continue to the next privacy-safe projection candidate.
+    }
+  }
+  return undefined;
+}
+
+export function actionRecords(events) {
   const starts = new Map();
   const records = [];
   for (const event of events) {
@@ -175,24 +237,164 @@ function actionRecords(events, fixturePid, allowedApps) {
       const resultCode = typeof text === 'string'
         ? text.match(/\bfailed:\s*([a-z][a-z0-9_]{1,63})\b/i)?.[1]
         : undefined;
-      const type = start.args?.action;
-      const targetOwned = type === 'observe'
-        || type === 'screenshot'
-        ? allowedApps.has(start.args?.app)
-          && (parseOwnedTarget(text, fixturePid) || event.isError === false)
-        : type === 'list_apps'
-          ? false
-        : typeof start.args?.observationId === 'string';
+      const target = parseTargetEvidence(text);
       records.push(sanitizeCuActionRecord({
         action: start.args,
+        toolCallId: event.toolUseId,
+        sourceObservationId: start.args?.observation_id,
+        resultObservationId: target?.observationId,
+        targetPid: target?.pid,
+        targetWindowId: target?.windowId,
         durationMs: event.durationMs,
         text,
         success: event.isError === false && !resultCode,
-        targetOwned,
       }));
     }
   }
   return records;
+}
+
+export async function waitForTraceFlush(
+  path,
+  expectedToolCallIds,
+  timeoutMs = 2_000,
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const current = await readFile(path, 'utf8').catch((error) => {
+      if (error?.code === 'ENOENT') return '';
+      throw error;
+    });
+    const traces = [];
+    let incompleteTrace = false;
+    for (const line of current.split('\n').filter(Boolean)) {
+      try {
+        traces.push(JSON.parse(line));
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
+        incompleteTrace = true;
+      }
+    }
+    const observedToolCallIds = new Set(
+      traces
+        .filter((trace) => trace.type === 'dispatch')
+        .map((trace) => trace.toolCallId),
+    );
+    if (
+      !incompleteTrace
+      && expectedToolCallIds.every((toolCallId) =>
+        observedToolCallIds.has(toolCallId))
+    ) {
+      return traces;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(
+    `timed out waiting for Computer Use dispatch traces: ${expectedToolCallIds.join(',')}`,
+  );
+}
+
+export async function discoverFixtureIdentity(
+  fixturePid,
+  windowSpecs,
+  {
+    listApps,
+    timeoutMs = 2_000,
+    pollIntervalMs = 50,
+  } = {},
+) {
+  if (!Number.isInteger(fixturePid) || fixturePid <= 0) {
+    throw new Error('fixture discovery requires a valid launcher-owned pid');
+  }
+  if (typeof listApps !== 'function') {
+    throw new Error('fixture discovery requires an independent window lister');
+  }
+  const expectedTitles = windowSpecs?.map((window) => window.title);
+  if (
+    !Array.isArray(expectedTitles)
+    || expectedTitles.length === 0
+    || expectedTitles.some((title) => typeof title !== 'string' || title.length === 0)
+    || new Set(expectedTitles).size !== expectedTitles.length
+  ) {
+    throw new Error('fixture discovery requires unique expected window titles');
+  }
+
+  const deadline = Date.now() + timeoutMs;
+  let lastFailure = 'fixture app was not found';
+  while (Date.now() < deadline) {
+    const apps = await listApps();
+    const fixtureApps = Array.isArray(apps)
+      ? apps.filter((app) => Number(app?.pid) === fixturePid)
+      : [];
+    if (fixtureApps.length === 1) {
+      const windows = Array.isArray(fixtureApps[0].windows)
+        ? fixtureApps[0].windows
+        : [];
+      const windowIds = [];
+      let complete = true;
+      for (const title of expectedTitles) {
+        const matches = windows.filter((window) =>
+          window?.title === title
+          && Number.isInteger(window?.windowId)
+          && window.windowId > 0);
+        if (matches.length !== 1) {
+          complete = false;
+          lastFailure = `expected one fixture window "${title}", got ${matches.length}`;
+          break;
+        }
+        windowIds.push(matches[0].windowId);
+      }
+      if (complete && new Set(windowIds).size === windowIds.length) {
+        return {
+          instances: [{
+            pid: fixturePid,
+            windowIds,
+          }],
+        };
+      }
+      if (complete) lastFailure = 'fixture discovery returned duplicate window ids';
+    } else {
+      lastFailure = `expected one fixture app for pid ${fixturePid}, got ${fixtureApps.length}`;
+    }
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, pollIntervalMs));
+  }
+  throw new Error(`fixture identity discovery failed: ${lastFailure}`);
+}
+
+async function discoverLauncherFixtureIdentity(fixturePid, windowSpecs) {
+  const [{ createCuaDriverBackend }, manifestText] = await Promise.all([
+    import('../packages/computer-use/dist/index.js'),
+    readFile(join(repoRoot, 'apps', 'desktop', 'bundled-tools.json'), 'utf8'),
+  ]);
+  const manifest = JSON.parse(manifestText);
+  const expectedBinarySha256 = manifest?.cuaDriver?.binarySha256;
+  const expectedServerVersion = manifest?.cuaDriver?.expectedVersion;
+  const expectedProtocolVersion = manifest?.cuaDriver?.expectedProtocolVersion;
+  if (
+    typeof expectedBinarySha256 !== 'string'
+    || !/^[a-f0-9]{64}$/.test(expectedBinarySha256)
+    || typeof expectedServerVersion !== 'string'
+    || typeof expectedProtocolVersion !== 'string'
+  ) {
+    throw new Error('fixture discovery cannot verify bundled cua-driver identity');
+  }
+  const backend = createCuaDriverBackend({
+    binaryPath: join(repoRoot, 'apps', 'desktop', 'resources', 'bin', 'cua-driver'),
+    hostBundleId: 'com.maka.desktop',
+    expectedBinarySha256,
+    expectedServerName: 'cua-driver',
+    expectedServerVersion,
+    expectedProtocolVersion,
+    timeoutMs: 10_000,
+  });
+  try {
+    return await discoverFixtureIdentity(fixturePid, windowSpecs, {
+      listApps: () => backend.listApps(new AbortController().signal),
+      timeoutMs: 5_000,
+    });
+  } finally {
+    backend.dispose();
+  }
 }
 
 function safeEvent(event) {
@@ -252,6 +454,7 @@ function safeFailureMetadata(message) {
 }
 
 async function run() {
+  const lineage = await reportLineage();
   const userData = await mkdtemp(join(tmpdir(), 'maka-cu-real-model-'));
   const workspace = join(userData, 'workspaces', 'default');
   const tracePath = join(userData, 'computer-use-trace.jsonl');
@@ -277,7 +480,12 @@ async function run() {
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    await waitForLine(fixture, 'CU_FIXTURE_READY', 30_000);
+    const readyOutput = await waitForLine(fixture, 'CU_FIXTURE_READY', 30_000);
+    const fixturePid = parseFixtureReady(readyOutput, fixture.pid);
+    const fixtureIdentity = await discoverLauncherFixtureIdentity(
+      fixturePid,
+      activeWindowSpecs(scenario),
+    );
 
     desktop = await electron.launch({
       args: ['apps/desktop'],
@@ -295,7 +503,7 @@ async function run() {
               scenario.maxTotalActions,
             ]),
           ),
-          allowedApps: scenario.fixtureSetup.windows.map((window) => window.title),
+          allowedApps: activeWindowSpecs(scenario).map((window) => window.title),
         }),
         MAKA_CU_REAL_MODEL_TRACE: tracePath,
       },
@@ -381,20 +589,21 @@ async function run() {
     }
     const evaluation = evaluateCuE2eScenarioState(scenario, fixtureState);
     const events = runResult.events.map(safeEvent).filter(Boolean);
-    const driverTraces = await readFile(tracePath, 'utf8')
-      .then((text) => text.split('\n').filter(Boolean).map((line) => JSON.parse(line)))
-      .catch((error) => {
-        if (error?.code === 'ENOENT') return [];
-        throw error;
-      });
+    const rawActions = actionRecords(runResult.events);
+    const expectedDispatchToolCallIds = rawActions
+      .filter((action) =>
+        action.success === true
+        && !['list_apps', 'observe', 'screenshot', 'cursor_position', 'wait'].includes(action.type))
+      .map((action) => action.toolCallId)
+      .filter((toolCallId) => typeof toolCallId === 'string');
+    const driverTraces = await waitForTraceFlush(
+      tracePath,
+      expectedDispatchToolCallIds,
+    );
     const actions = bindActionTargets(
-      actionRecords(
-        runResult.events,
-        fixture.pid,
-        new Set(activeWindowSpecs(scenario).map((window) => window.title)),
-      ),
+      rawActions,
       driverTraces,
-      fixture.pid,
+      fixtureIdentity,
     );
     const runStore = createAgentRunStore(workspace);
     const runHeader = await waitForRunHeader(
@@ -406,7 +615,11 @@ async function run() {
       action.success === true
       && action.targetOwned === true
       && scenario.allowedActions.includes(action.type));
-    const actionCounts = Object.fromEntries(
+    const actionCounts = Object.fromEntries(actions.reduce((counts, action) => {
+      counts.set(action.type, (counts.get(action.type) ?? 0) + 1);
+      return counts;
+    }, new Map()));
+    const qualifyingActionCounts = Object.fromEntries(
       scenario.allowedActions.map((action) => [
         action,
         qualifyingActions.filter((record) => record.type === action).length,
@@ -414,7 +627,7 @@ async function run() {
     );
     const minimumActionsPassed = Object.entries(
       scenario.minimumActionCounts ?? {},
-    ).every(([action, minimum]) => (actionCounts[action] ?? 0) >= minimum);
+    ).every(([action, minimum]) => (qualifyingActionCounts[action] ?? 0) >= minimum);
     const terminalPassed =
       runResult.terminalEvent.type === 'complete'
       && runResult.terminalEvent.stopReason === 'end_turn';
@@ -430,21 +643,26 @@ async function run() {
       scenario,
       driverTraces,
     );
-    const qualified = terminalPassed
+    const ownershipPassed = allActionTargetsOwned(actions);
+    const localChecksPassed = terminalPassed
       && minimumActionsPassed
       && actionsWithinBudget
       && dispatchPathPassed
+      && ownershipPassed
       && evaluation.pass;
-    const report = sanitizeCuReport({
+    const reportInput = {
       schemaVersion: 1,
+      ...lineage,
       evidenceClass: 'real-runtime',
       policyMode: 'bypassed',
+      qualificationEligible: true,
       toolExposure: 'direct-e2e',
       scenarioId: scenario.id,
       producer: 'cu-real-model-launcher',
       transportClass: 'live-network',
       provider: runResult.connection.providerType,
       model: runResult.connection.model,
+      fixtureIdentity,
       terminal: safeEvent(runResult.terminalEvent),
       run: runHeader
         ? {
@@ -456,6 +674,7 @@ async function run() {
               : undefined,
           }
         : undefined,
+      actionAttempts: actions.length,
       actionCount: actions.length,
       actionCounts,
       minimumActionsPassed,
@@ -470,21 +689,42 @@ async function run() {
           : 'fail',
         violations: evaluation.forbidden.filter((entry) => !entry.pass),
       },
-      status: qualified
+      status: localChecksPassed
         ? 'pass'
         : terminalPassed && minimumActionsPassed
           ? 'fail'
           : 'inconclusive',
       traces: events.map(sanitizeCuTrace).filter(Boolean),
       driverTraces: driverTraces.map(sanitizeCuTrace).filter(Boolean),
+    };
+    const provider = {
+      id: runResult.connection.providerType,
+      producer: 'cu-real-model-launcher',
+      model: runResult.connection.model,
+    };
+    const provisionalReport = sanitizeCuReport(reportInput);
+    const qualificationErrors = validateRealReport(
+      { ...provisionalReport, status: 'pass' },
+      provider,
+      scenario,
+    );
+    const report = sanitizeCuReport({
+      ...reportInput,
+      status: qualificationErrors.length === 0 ? 'pass' : 'fail',
     });
+    const validationErrors = validateRealReport(report, provider, scenario);
     await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`, {
       flag: 'wx',
       mode: 0o600,
     });
     process.stdout.write(`Real-model Computer Use report: ${reportPath}\n`);
     process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
-    if (!qualified) process.exitCode = 1;
+    if (validationErrors.length > 0) {
+      process.stderr.write(
+        `Real-model Computer Use qualification failed: ${validationErrors.join('; ')}\n`,
+      );
+      process.exitCode = 1;
+    }
   } finally {
     await fixtureBrowser?.close().catch(() => {});
     await desktop?.close().catch(() => {});
@@ -499,9 +739,11 @@ async function run() {
   }
 }
 
-run().catch(async (error) => {
+async function handleRunFailure(error) {
+  const lineage = await reportLineage().catch(() => undefined);
   const failure = sanitizeCuReport({
     schemaVersion: 1,
+    ...lineage,
     evidenceClass: 'real-runtime',
     scenarioId: scenario.id,
     producer: 'cu-real-model-launcher',
@@ -524,7 +766,7 @@ run().catch(async (error) => {
   }).catch(() => {});
   console.error('Real-model Computer Use E2E failed');
   process.exitCode = 1;
-});
+}
 
 function requiredDispatchPathPassed(scenario, traces) {
   const mutationActions = scenario.allowedActions.filter((action) =>
@@ -538,23 +780,75 @@ function requiredDispatchPathPassed(scenario, traces) {
     ));
 }
 
-function bindActionTargets(actions, traces, fixturePid) {
+function fixtureOwnsTarget(fixtureIdentity, pid, windowId) {
+  return fixtureIdentity?.instances?.some((instance) =>
+    instance.pid === pid
+    && instance.windowIds?.includes(windowId)) === true;
+}
+
+export function bindActionTargets(actions, traces, fixtureIdentity) {
   const dispatches = traces.filter((trace) =>
     trace.type === 'dispatch'
-    && Number(trace.pid) === fixturePid
     && (
       trace.address === 'ax'
       || trace.address === 'semantic'
     ));
+  const observationTargets = new Map(
+    actions.flatMap((action) =>
+      (action.type === 'observe' || action.type === 'screenshot')
+      && typeof action.resultObservationId === 'string'
+      && Number.isInteger(action.targetPid)
+      && Number.isInteger(action.targetWindowId)
+        ? [[action.resultObservationId, {
+            pid: action.targetPid,
+            windowId: action.targetWindowId,
+          }]]
+        : []),
+  );
   const consumed = new Set();
   return actions.map((action) => {
-    if (typeof action.targetOwned === 'boolean') return action;
+    if (['list_apps', 'wait', 'cursor_position'].includes(action.type)) {
+      return { ...action, targetOwned: false };
+    }
     const index = dispatches.findIndex((trace, traceIndex) =>
       !consumed.has(traceIndex)
+      && trace.toolCallId === action.toolCallId
       && trace.actionType === action.type);
     if (index >= 0) consumed.add(index);
-    return { ...action, targetOwned: index >= 0 };
+    const dispatch = index >= 0 ? dispatches[index] : undefined;
+    const sourceTarget = typeof action.sourceObservationId === 'string'
+      ? observationTargets.get(action.sourceObservationId)
+      : undefined;
+    const directObservationTarget =
+      (action.type === 'observe' || action.type === 'screenshot')
+      && Number.isInteger(action.targetPid)
+      && Number.isInteger(action.targetWindowId)
+        ? { pid: action.targetPid, windowId: action.targetWindowId }
+        : undefined;
+    const target = dispatch
+      ? { pid: dispatch.pid, windowId: dispatch.windowId }
+      : sourceTarget
+        ? sourceTarget
+        : directObservationTarget;
+    return {
+      ...action,
+      targetOwned: target
+        ? fixtureOwnsTarget(fixtureIdentity, target.pid, target.windowId)
+        : false,
+      ...(target
+        ? {
+            targetPid: target.pid,
+            targetWindowId: target.windowId,
+          }
+        : {}),
+    };
   });
+}
+
+export function allActionTargetsOwned(actions) {
+  return actions.every((action) =>
+    ['list_apps', 'wait', 'cursor_position'].includes(action.type)
+    || action.targetOwned === true);
 }
 
 function activeWindowSpecs(scenario) {
@@ -583,4 +877,11 @@ async function waitForRunHeader(store, sessionId, turnId) {
     await new Promise((resolve) => setTimeout(resolve, 50));
   } while (Date.now() < deadline);
   return latest;
+}
+
+if (
+  process.argv[1]
+  && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))
+) {
+  run().catch(handleRunFailure);
 }
