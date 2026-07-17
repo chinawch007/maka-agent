@@ -30,7 +30,6 @@ import { join } from 'node:path';
 import {
   PENDING_AUTHORIZATION_TTL_MS,
   PKCE_VERIFIER_LENGTH_BYTES,
-  TOKEN_REFRESH_SKEW_MS,
   base64urlEncode,
   constantTimeStringEqual,
   type AuthorizationUrlPayload,
@@ -38,7 +37,11 @@ import {
   type SubscriptionActionResult,
 } from '@maka/core';
 import {
+  refreshAndPersistOAuthSubscriptionTokens,
   refreshOAuthSubscriptionTokens,
+  resolveAndPersistOAuthSubscriptionTokens,
+  type OAuthSubscriptionRefreshAndPersistOutcome,
+  type OAuthSubscriptionTokens,
 } from '@maka/runtime';
 import {
   deleteSharedOAuthTokens,
@@ -133,13 +136,6 @@ export class OpenAiCodexService {
   private lastStorageFailedMessage: string | null = null;
   private authorizing = false;
   private refreshing = false;
-  /**
-   * Bumped by logout. A refresh that started before the bump discards
-   * its result instead of writing tokens back after the user logged
-   * out — in this process, logout is terminal even against an
-   * in-flight refresh's read→network→write window.
-   */
-  private credentialEpoch = 0;
 
   constructor(deps: OpenAiCodexServiceDeps) {
     this.legacyTokenFilePath = join(deps.userDataDir, '.codex_subscription_token');
@@ -334,44 +330,18 @@ export class OpenAiCodexService {
    * click 重新登录.
    */
   async refreshTokens(): Promise<SubscriptionActionResult> {
-    const tokens = await this.loadTokens();
-    if (!tokens) return { ok: false, reason: 'refresh_failed', message: '当前未登录。' };
-    const epoch = this.credentialEpoch;
     this.refreshing = true;
     try {
-      const next = await refreshOAuthSubscriptionTokens({
-        providerType: 'openai-codex',
-        tokens,
+      const result = await refreshAndPersistOAuthSubscriptionTokens({
+        slug: 'codex-subscription',
+        credentialStore: this.credentialStore,
         now: this.now,
         fetchFn: this.fetchFn,
+        refreshTokens: (tokens) => this.requestTokenRefresh(tokens),
       });
-      if (epoch !== this.credentialEpoch) {
-        // Logout landed while the refresh was in flight: drop the
-        // result instead of resurrecting the deleted credential.
-        this.refreshing = false;
-        return { ok: false, reason: 'refresh_failed', message: '登录状态已变更，本次刷新结果已丢弃。' };
-      }
-      const claims = extractAccountClaims(next.access_token, next.id_token);
-      try {
-        await this.saveTokens({
-          access_token: next.access_token,
-          refresh_token: next.refresh_token,
-          id_token: next.id_token,
-          expires_at: next.expires_at,
-          account_id: claims.accountId || tokens.account_id,
-        });
-      } catch {
-        this.refreshing = false;
-        return { ok: false, reason: 'storage_failed', message: this.lastStorageFailedMessage ?? '写入共享凭据失败，请检查 credentials.json 权限后重试。' };
-      }
-      this.lastRefreshFailedMessage = null;
+      return this.applyRefreshOutcome(result);
+    } finally {
       this.refreshing = false;
-      return { ok: true };
-    } catch (err) {
-      this.refreshing = false;
-      const message = err instanceof Error ? err.message : '刷新失败，请重新登录。';
-      this.lastRefreshFailedMessage = message;
-      return { ok: false, reason: 'refresh_failed', message };
     }
   }
 
@@ -383,7 +353,6 @@ export class OpenAiCodexService {
    * can rely on).
    */
   async logout(): Promise<SubscriptionActionResult> {
-    this.credentialEpoch += 1;
     this.lastRefreshFailedMessage = null;
     this.lastStorageFailedMessage = null;
     for (const id of [...this.pending.keys()]) this.disposePending(id);
@@ -412,15 +381,29 @@ export class OpenAiCodexService {
    * process — never IPC it out.
    */
   async getAccessTokenInternal(options: { forceRefresh?: boolean } = {}): Promise<string | null> {
-    const tokens = await this.loadTokens();
-    if (!tokens) return null;
-    if (options.forceRefresh || tokens.expires_at - this.now() <= TOKEN_REFRESH_SKEW_MS) {
+    if (options.forceRefresh) {
       const refreshed = await this.refreshTokens();
       if (!refreshed.ok) return null;
       const next = await this.loadTokens();
       return next?.access_token ?? null;
     }
-    return tokens.access_token;
+    this.refreshing = true;
+    try {
+      const result = await resolveAndPersistOAuthSubscriptionTokens({
+        slug: 'codex-subscription',
+        credentialStore: this.credentialStore,
+        now: this.now,
+        fetchFn: this.fetchFn,
+        refreshTokens: (tokens) => this.requestTokenRefresh(tokens),
+      });
+      if (result.outcome === 'current') return result.tokens.access_token;
+      const action = this.applyRefreshOutcome(result);
+      return action.ok && (result.outcome === 'refreshed' || result.outcome === 'superseded')
+        ? result.tokens.access_token
+        : null;
+    } finally {
+      this.refreshing = false;
+    }
   }
 
   /**
@@ -438,6 +421,37 @@ export class OpenAiCodexService {
   // -----------------------------------------------------------
   // INTERNALS
   // -----------------------------------------------------------
+
+  private async requestTokenRefresh(tokens: OAuthSubscriptionTokens): Promise<OAuthSubscriptionTokens> {
+    const next = await refreshOAuthSubscriptionTokens({
+      providerType: 'openai-codex',
+      tokens,
+      now: this.now,
+      fetchFn: this.fetchFn,
+    });
+    const claims = extractAccountClaims(next.access_token, next.id_token);
+    return { ...next, account_id: claims.accountId || tokens.account_id };
+  }
+
+  private applyRefreshOutcome(result: OAuthSubscriptionRefreshAndPersistOutcome): SubscriptionActionResult {
+    if (result.outcome === 'refreshed' || result.outcome === 'superseded') {
+      this.lastRefreshFailedMessage = null;
+      this.lastStorageFailedMessage = null;
+      return { ok: true };
+    }
+    if (result.outcome === 'storage-failed') {
+      const message = '访问 Codex OAuth 共享凭据失败，请检查 credentials.json 权限后重试。';
+      this.lastRefreshFailedMessage = null;
+      this.lastStorageFailedMessage = message;
+      return { ok: false, reason: 'storage_failed', message };
+    }
+    this.lastStorageFailedMessage = null;
+    const message = result.outcome === 'logged-out'
+      ? '登录状态已变更，本次刷新结果已丢弃。'
+      : result.error instanceof Error ? result.error.message : '刷新失败，请重新登录。';
+    this.lastRefreshFailedMessage = message;
+    return { ok: false, reason: 'refresh_failed', message };
+  }
 
   private deriveRuntimeState(): CodexRuntimeState {
     if (this.refreshing) return 'refreshing';
