@@ -118,6 +118,7 @@ export function readLastSettingsSection(): SettingsSection {
   // page lands on 语音 (the more user-frequent of the two split
   // pages) instead of being silently bounced back to 模型.
   if (value === 'voice-gateway') return 'voice';
+  if (value === 'mcp') return 'models';
   if (SETTINGS_NAV.some((item) => item.id === value)) {
     return value as SettingsSection;
   }
