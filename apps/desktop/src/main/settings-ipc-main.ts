@@ -1,11 +1,14 @@
-import { ipcMain } from 'electron';
+import { app, ipcMain, shell } from 'electron';
 import {
   generalizedErrorMessageChinese,
   redactSecrets,
 } from '@maka/core';
 import type {
   AppSettings,
+  BotOnboardingSnapshot,
+  BotOnboardingStartInput,
   BotProvider,
+  BotReadinessState,
   SettingsTestResult,
   UpdateAppSettingsInput,
   UpdateAppSettingsResult,
@@ -15,7 +18,7 @@ import {
   type TestProxyInput,
   type TestProxyResult,
 } from '@maka/core/settings/network-settings';
-import { err, ok, tryResult, type Result } from '@maka/core/settings/result';
+import { tryResult } from '@maka/core/settings/result';
 import {
   getWechatBridgeQrCode,
   testBotChannel as testRuntimeBotChannel,
@@ -23,7 +26,10 @@ import {
 import type { BotRegistry } from '@maka/runtime';
 import { testProxyConnection } from '@maka/runtime/network/proxy-test';
 import type { SettingsStore } from '@maka/storage';
-import { fetchWeChatQrcode, pollWeChatQrcodeStatus } from './wechat-scan-login.js';
+import {
+  BotOnboardingService,
+  type BotOnboardingProviderAdapter,
+} from './bot-onboarding-main.js';
 import { toContractNetworkSettings } from './network-settings-main.js';
 import {
   botTestErrorMessage,
@@ -37,6 +43,11 @@ export interface SettingsIpcDeps {
   botRegistry: BotRegistry;
   normalizeSettingsPatch: (patch: UpdateAppSettingsInput) => Promise<UpdateAppSettingsInput>;
   applySettingsRuntimeEffects: (settings: AppSettings, patch: UpdateAppSettingsInput) => Promise<void>;
+  botOnboardingAdapters?: Partial<Record<BotOnboardingStartInput['provider'], BotOnboardingProviderAdapter>>;
+  botOnboardingApplySettingsRuntimeEffects?: (settings: AppSettings, patch: UpdateAppSettingsInput) => Promise<void>;
+  botOnboardingReadChannelStatus?: (
+    provider: BotOnboardingStartInput['provider'],
+  ) => { running: boolean; reason?: string };
 }
 
 function proxyTestFailureMessage(result: TestProxyResult): string {
@@ -52,20 +63,24 @@ function proxyTestFailureMessage(result: TestProxyResult): string {
   return '代理不可达，请检查代理服务器地址、端口或认证信息。';
 }
 
-function weChatQrFailureMessage(error: unknown): string {
-  return generalizedErrorMessageChinese(error, '微信扫码登录暂时不可用，请稍后重试。');
+export interface SettingsIpcHandle {
+  /** Tear down onboarding sessions (abort polls, clear the session map). */
+  dispose(): void;
 }
 
-async function tryWeChatQrResult<T>(fn: () => Promise<T>, errorCode: string): Promise<Result<T>> {
-  try {
-    return ok(await fn());
-  } catch (error) {
-    return err(errorCode, weChatQrFailureMessage(error));
-  }
-}
-
-export function registerSettingsIpc(deps: SettingsIpcDeps): void {
+export function registerSettingsIpc(deps: SettingsIpcDeps): SettingsIpcHandle {
   const { settingsStore, botRegistry, normalizeSettingsPatch, applySettingsRuntimeEffects } = deps;
+  const botOnboarding = new BotOnboardingService({
+    settingsStore,
+    botRegistry,
+    applySettingsRuntimeEffects: deps.botOnboardingApplySettingsRuntimeEffects ?? applySettingsRuntimeEffects,
+    adapters: deps.botOnboardingAdapters,
+    ...(deps.botOnboardingReadChannelStatus
+      ? { readChannelStatus: deps.botOnboardingReadChannelStatus }
+      : {}),
+    productVersion: app.getVersion(),
+    openExternal: (url) => shell.openExternal(url),
+  });
 
   ipcMain.handle('settings:get', async () => maskAppSettings(await settingsStore.get()));
   ipcMain.handle('settings:update', async (_event, patch: UpdateAppSettingsInput): Promise<UpdateAppSettingsResult> => {
@@ -108,17 +123,25 @@ export function registerSettingsIpc(deps: SettingsIpcDeps): void {
   ipcMain.handle('settings:testBotChannel', async (_event, provider: BotProvider) => {
     const settings = await settingsStore.get();
     const result = await testRuntimeBotChannel(provider, settings.botChat.channels[provider]);
+    // PR1197 review (P1-4): an unverified probe (`verified === false`, e.g. the
+    // WeCom AI-bot shape check) proves nothing about live connectivity, so it
+    // must NOT overwrite connected/readiness — doing so would mark a working
+    // channel disconnected. Record only that a test ran; the live bridge status
+    // stays authoritative. A real credential probe persists the outcome as before.
+    const channelPatch = result.verified === false
+      ? { lastTestAt: Date.now() }
+      : {
+          connected: result.ok,
+          readiness: (result.ok ? 'credentials_valid' : 'configured') as BotReadinessState,
+          readinessReason: result.ok ? undefined : botTestErrorMessage(provider, result.error),
+          readinessUpdatedAt: Date.now(),
+          lastTestAt: Date.now(),
+          lastError: result.ok ? undefined : botTestErrorMessage(provider, result.error),
+        };
     await settingsStore.update({
       botChat: {
         channels: {
-          [provider]: {
-            connected: result.ok,
-            readiness: result.ok ? 'credentials_valid' : 'configured',
-            readinessReason: result.ok ? undefined : botTestErrorMessage(provider, result.error),
-            readinessUpdatedAt: Date.now(),
-            lastTestAt: Date.now(),
-            lastError: result.ok ? undefined : botTestErrorMessage(provider, result.error),
-          },
+          [provider]: channelPatch,
         },
       },
     });
@@ -136,25 +159,35 @@ export function registerSettingsIpc(deps: SettingsIpcDeps): void {
       return botRegistry.getStatus(provider);
     }, 'BOTS_RESTART_FAILED'),
   );
+  ipcMain.handle('settings:bots:onboarding:start', (_event, input: BotOnboardingStartInput) =>
+    tryResult<BotOnboardingSnapshot>(
+      () => botOnboarding.start(input),
+      'BOT_ONBOARDING_START_FAILED',
+    ),
+  );
+  ipcMain.handle('settings:bots:onboarding:poll', (_event, sessionId: unknown) =>
+    tryResult<BotOnboardingSnapshot>(
+      () => botOnboarding.poll(sessionId),
+      'BOT_ONBOARDING_POLL_FAILED',
+    ),
+  );
+  ipcMain.handle('settings:bots:onboarding:cancel', (_event, sessionId: unknown) =>
+    tryResult<BotOnboardingSnapshot>(
+      async () => botOnboarding.cancel(sessionId),
+      'BOT_ONBOARDING_CANCEL_FAILED',
+    ),
+  );
+  ipcMain.handle('settings:bots:onboarding:open', (_event, sessionId: unknown) =>
+    tryResult<void>(
+      () => botOnboarding.openInBrowser(sessionId),
+      'BOT_ONBOARDING_OPEN_FAILED',
+    ),
+  );
 
-  // PR-BOT-WECHAT-QR-MODAL-0 (WAWQAQ msg `10ec1fbe`): WeChat ClawBot
-  // scan-login. Renderer triggers the QR fetch from the modal, then
-  // polls the status endpoint until 'confirmed' or 'expired'. Main
-  // process owns the actual HTTP calls so the renderer never sees
-  // raw response bodies.
-  ipcMain.handle('settings:bots:wechat:fetchQrcode', () =>
-    tryWeChatQrResult(async () => fetchWeChatQrcode(), 'WECHAT_QR_FETCH_FAILED'),
-  );
-  ipcMain.handle('settings:bots:wechat:pollQrcodeStatus', (_event, qrToken: unknown) =>
-    tryWeChatQrResult(async () => {
-      if (typeof qrToken !== 'string' || !qrToken) {
-        throw new Error('qrToken must be a non-empty string');
-      }
-      return pollWeChatQrcodeStatus(qrToken);
-    }, 'WECHAT_QR_STATUS_FAILED'),
-  );
   ipcMain.handle('settings:bots:wechatQrCode', async () => {
     const settings = await settingsStore.get();
     return getWechatBridgeQrCode(settings.botChat.channels.wechat);
   });
+
+  return { dispose: () => botOnboarding.dispose() };
 }
