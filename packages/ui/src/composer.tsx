@@ -11,7 +11,7 @@ import {
   type ReactNode,
 } from 'react';
 import { useMountedRef } from './use-mounted-ref.js';
-import { ArrowUp, Blocks, Paperclip, Plus } from './icons.js';
+import { ArrowUp, Blocks, Paperclip, Pencil, Plus } from './icons.js';
 import { ChatModelSwitcher, ModelChipStatic, NewChatModelPicker } from './chat-model-switcher.js';
 import { useUiLocale } from './locale-context.js';
 import { getConversationCopy } from './conversation-copy.js';
@@ -54,6 +54,12 @@ export interface ComposerHandle {
   setText(text: string): void;
   /** Append a prompt/context fragment after the existing draft instead of replacing it. */
   appendText(text: string): void;
+  /** Read the current uncontrolled textarea value. */
+  getText(): string;
+  /** Clear one persisted draft without affecting a different active session. */
+  clearDraft(draftKey: string): void;
+  /** Write a specific session draft before navigation changes the active key. */
+  setDraft(draftKey: string, text: string): void;
   /** Move focus to the textarea without changing its content. */
   focus(): void;
 }
@@ -143,6 +149,18 @@ export const Composer = forwardRef<
      * constant footprint (#740).
      */
     noModelConnection?: boolean;
+    /**
+     * Optional edit-and-resend banner above the composer. Desktop owns the
+     * revision draft; Composer only renders the notice + cancel affordance.
+     */
+    revisionNotice?: {
+      /** Short primary status, e.g. "修改已发送消息". */
+      title: string;
+      /** Optional quieter secondary line under the title. */
+      detail?: string;
+      cancelLabel: string;
+      onCancel(): void;
+    };
     workspacePicker?: ComposerWorkspacePicker;
     /**
      * Git branch picker for the workspace row, shown to the right of
@@ -211,7 +229,7 @@ export const Composer = forwardRef<
   // (issue #1044). `resetPromptHistoryNavigation` is a hoisted wrapper so the
   // draft hook's swap effect can reset history navigation even though the
   // history hook is created one line below it.
-  const { hasDraftText, saveCurrentDraft, clearDraft, activeDraftKey } = useComposerDraft({
+  const { hasDraftText, saveCurrentDraft, clearDraft, setDraft, activeDraftKey } = useComposerDraft({
     textareaRef,
     draftKey: props.draftKey,
     autoResize,
@@ -293,6 +311,27 @@ export const Composer = forwardRef<
         autoResize();
         focusTextInputAtEnd(el);
       },
+      getText() {
+        return textareaRef.current?.value ?? '';
+      },
+      clearDraft(draftKey: string) {
+        clearDraft(draftKey);
+        if (activeDraftKey() !== draftKey) return;
+        const el = textareaRef.current;
+        if (el) el.value = '';
+        saveCurrentDraft('');
+        autoResize();
+      },
+      setDraft(draftKey: string, text: string) {
+        setDraft(draftKey, text);
+        if (activeDraftKey() !== draftKey) return;
+        const el = textareaRef.current;
+        if (!el) return;
+        resetPromptHistoryNavigation();
+        el.value = text;
+        autoResize();
+        focusTextInputAtEnd(el);
+      },
       focus() {
         textareaRef.current?.focus();
       },
@@ -322,6 +361,9 @@ export const Composer = forwardRef<
     // survives page reloads and is shared across all input surfaces.
     rememberSentEntry(text);
     clearDraft(submittedDraftKey);
+    // The owner may have changed while onSend awaited (new-session creation,
+    // revision branch, or user navigation). Never erase a foreign draft.
+    if (activeDraftKey() !== submittedDraftKey) return;
     saveCurrentDraft('');
     form?.reset();
     // form.reset() empties the textarea but doesn't fire input — collapse
@@ -520,6 +562,24 @@ export const Composer = forwardRef<
               {copy.noModelAction}
             </button>
           )}
+        </div>
+      )}
+      {!props.hidden && props.revisionNotice && (
+        <div className="maka-composer-revision-notice" role="status" data-revision-notice="true">
+          <Pencil size={13} aria-hidden="true" />
+          <span className="maka-composer-revision-notice-text">
+            {props.revisionNotice.title}
+            {props.revisionNotice.detail ? <span className="maka-composer-revision-notice-detail">{props.revisionNotice.detail}</span> : null}
+          </span>
+          <button
+            type="button"
+            className="maka-composer-revision-notice-cancel"
+            disabled={sendPending}
+            aria-busy={sendPending ? 'true' : undefined}
+            onClick={() => props.revisionNotice?.onCancel()}
+          >
+            {props.revisionNotice.cancelLabel}
+          </button>
         </div>
       )}
       <form

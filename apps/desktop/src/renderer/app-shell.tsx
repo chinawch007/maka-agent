@@ -13,6 +13,7 @@ import {
 import type { PermissionMode, PlanReminder, SessionSummary, UiLocale, UiLocalePreference } from '@maka/core';
 import {
   buildDeepResearchImplementationPrompt,
+  collapseSessionRevisions,
   hasSettledInitialOnboarding,
   parseSwarmCommand,
   resolveUiLocale,
@@ -49,6 +50,7 @@ import type { OnboardingSnapshot } from '../preload/bridge-contract.js';
 import { ProviderLogo } from './settings/provider-display';
 import { ProviderBrandMark } from './settings/provider-brand-marks';
 import { getShellCopy, localizedShellErrorMessage } from './locales/shell-copy';
+import { getDesktopConversationCopy } from './locales/conversation-copy';
 import { ErrorBoundary } from './error-boundary';
 import { useShellAppearance } from './use-shell-appearance';
 import { useShellSearch } from './use-shell-search';
@@ -60,6 +62,7 @@ import { deriveAppShellTurnViewModel } from './app-shell-turn-view-model';
 import { readScrollMotionBehavior } from './scroll-motion-policy';
 import { deriveBranchBanner } from './branch-banner';
 import { filterSessions, readNavSelection } from './nav-selection';
+import { deriveSessionRevisionNavigation } from './session-revisions';
 import {
   SESSION_LIST_COLLAPSED_WIDTH,
   SESSION_LIST_EXPANDED_MAX_WIDTH,
@@ -78,6 +81,10 @@ import { createAppShellSessionEventHandlers } from './app-shell-session-events';
 import { createAppShellE2eFixtureActions } from './app-shell-e2e-fixture';
 import { createAppShellChatActions } from './app-shell-chat-actions';
 import { createAppShellTurnActions } from './app-shell-turn-actions';
+import {
+  createAppShellRevisionActions,
+  type TurnRevisionDraft,
+} from './app-shell-revision-actions';
 import { createAppShellLayoutActions } from './app-shell-layout-actions';
 import { createAppShellQuickChatActions } from './app-shell-quick-chat-actions';
 import { createAppShellDailyReviewActions } from './app-shell-daily-review-actions';
@@ -284,6 +291,25 @@ function AppShellContent({
   const [paletteOpen, openPalette, closePalette] = useCommandPalette();
   const [viewMode, setViewMode] = useState<SessionViewMode>('status');
   const composerRef = useRef<ComposerHandle>(null);
+  const [revisionDraft, setRevisionDraft] = useState<TurnRevisionDraft | null>(null);
+  const revisionDraftRef = useRef<TurnRevisionDraft | null>(null);
+  const commitRevisionDraft = useCallback((draft: TurnRevisionDraft | null) => {
+    revisionDraftRef.current = draft;
+    setRevisionDraft(draft);
+  }, []);
+  useEffect(() => {
+    const draft = revisionDraftRef.current;
+    if (!draft) return;
+    const source = sessions.find((session) => session.id === draft.sourceSessionId);
+    const owner = sessions.find((session) => session.id === draft.draftSessionId);
+    if (source && owner && !source.isArchived && !owner.isArchived) return;
+    composerRef.current?.clearDraft(draft.draftSessionId);
+    if (draft.sourceSessionId !== draft.draftSessionId) {
+      composerRef.current?.clearDraft(draft.sourceSessionId);
+    }
+    commitRevisionDraft(null);
+  }, [sessions, commitRevisionDraft]);
+
   const {
     resumePendingSessionId,
     resumeParkDescriptionBySession,
@@ -311,7 +337,14 @@ function AppShellContent({
   // Running → Waiting → Blocked → Active → Review → Done → Archived);
   // `aborted` is dropped. Pinned (flagged) sessions float to the top
   // in their own group, preserving the PR48 pin-floats behavior.
-  const visibleSessions = useMemo(() => filterSessions(sessions, navSelection), [sessions, navSelection]);
+  const sidebarSessions = useMemo(
+    () => collapseSessionRevisions(sessions, activeId),
+    [sessions, activeId],
+  );
+  const visibleSessions = useMemo(
+    () => filterSessions(sidebarSessions, navSelection),
+    [sidebarSessions, navSelection],
+  );
   const sessionStatusGroups = useMemo(
     () => deriveSessionStatusGroups(visibleSessions, { pinFirst: true, locale: uiLocale }),
     [visibleSessions, uiLocale],
@@ -426,7 +459,7 @@ function AppShellContent({
   const collaborationModeChangeRegistry = useKeyedPendingRegistry();
   const orchestrationModeChangeRegistry = useKeyedPendingRegistry();
   const sessionModelChangeRegistry = useKeyedPendingRegistry();
-  const pendingKeyOf = (sessionId: string, turnId: string, actionId: TurnFooterActionMeta['id']) =>
+  const pendingKeyOf = (sessionId: string, turnId: string, actionId: string) =>
     `${sessionId}:${turnId}:${actionId}`;
   function omitSessionKey<T>(current: Record<string, T>, sessionId: string): Record<string, T> {
     if (!(sessionId in current)) return current;
@@ -728,6 +761,10 @@ function AppShellContent({
     () => deriveBranchBanner(activeSession, sessions),
     [activeSession?.parentSessionId, sessions],
   );
+  const revisionNavigation = useMemo(
+    () => deriveSessionRevisionNavigation(sessions, activeId),
+    [sessions, activeId],
+  );
 
   function handleBranchBannerClick(parentSessionId: string): void {
     openSessionInChat(parentSessionId);
@@ -837,7 +874,7 @@ function AppShellContent({
     // sessions flash an 已阻塞 group on first paint until the first
     // refreshSessions() overwrites the seed.
     const next = seedSessions(snapshot.sessions);
-    bootstrapSelectionLease.reconcile(next);
+    bootstrapSelectionLease.reconcile(collapseSessionRevisions(next));
     // Seed connections — avoids separate connections:list + getDefault IPCs
     setConnections(snapshot.connections);
     setDefaultConnection(snapshot.defaultSlug);
@@ -1025,7 +1062,54 @@ function AppShellContent({
     upsertSessionSummary,
   });
 
+  const {
+    beginEditUserMessage,
+    prepareRevisionSend,
+    cancelRevisionDraft,
+  } = useStableActions(createAppShellRevisionActions, {
+    uiLocale,
+    activeIdRef,
+    composerRef,
+    messages,
+    hasPendingAttachments: () => pendingAttachments.length > 0,
+    openSessionInChat,
+    refreshMessages,
+    refreshSessions,
+    setMessages,
+    commitRevisionDraft,
+    revisionDraftRef,
+    toastApi,
+    upsertSessionSummary,
+  });
+
   async function sendWithAttachments(text: string): Promise<boolean | void> {
+    const revision = revisionDraftRef.current;
+    const revisionSend = Boolean(
+      revision && activeIdRef.current === revision.draftSessionId,
+    );
+    const swarmCommand = parseSwarmCommand(text);
+    if (
+      revisionSend &&
+      revision &&
+      text.trim() === revision.originalText.trim() &&
+      pendingAttachments.length === 0
+    ) {
+      const actionCopy = getDesktopConversationCopy(uiLocale).actions;
+      toastApi.info(actionCopy.revisionReadyTitle, actionCopy.revisionUnchanged);
+      return false;
+    }
+    if (revisionSend && revision) {
+      const actionCopy = getDesktopConversationCopy(uiLocale).actions;
+      if (pendingAttachments.length > 0) {
+        toastApi.info(actionCopy.revisionUnavailableTitle, actionCopy.revisionAttachmentsUnsupported);
+        return false;
+      }
+      if (text.trim() === '/compact' || swarmCommand) {
+        toastApi.info(actionCopy.revisionUnavailableTitle, actionCopy.revisionCommandUnsupported);
+        return false;
+      }
+      if (!(await prepareRevisionSend(text))) return false;
+    }
     if (text.trim() === '/compact') {
       const sessionId = activeIdRef.current;
       if (!sessionId) return true;
@@ -1045,7 +1129,6 @@ function AppShellContent({
         return false;
       }
     }
-    const swarmCommand = parseSwarmCommand(text);
     if (swarmCommand) {
       if (swarmCommand.kind === 'status') {
         const active = activeIdRef.current
@@ -1077,8 +1160,17 @@ function AppShellContent({
       return ok;
     }
     const pending = pendingAttachments.length > 0 ? pendingAttachments : undefined;
+    const expectedRevisionSessionId = revisionSend
+      ? revisionDraftRef.current?.draftSessionId
+      : undefined;
     const ok = await send(text, pending);
     if (ok !== false && pending) clearSubmittedAttachments(pending);
+    if (ok !== false && revisionSend) {
+      if (expectedRevisionSessionId) {
+        composerRef.current?.clearDraft(expectedRevisionSessionId);
+      }
+      commitRevisionDraft(null);
+    }
     return ok;
   }
 
@@ -1259,7 +1351,7 @@ function AppShellContent({
 
   async function bootstrapSessions() {
     const next = await refreshSessions();
-    bootstrapSelectionLease.reconcile(next);
+    bootstrapSelectionLease.reconcile(collapseSessionRevisions(next));
     bootstrapSelectionLease.release();
   }
 
@@ -1594,6 +1686,7 @@ function AppShellContent({
                 onRetryMessages={activeId ? () => void retryMessages(activeId) : undefined}
                 turnFooterActionsByTurn={turnFooterActionsByTurn}
                 onTurnFooterAction={handleTurnFooterAction}
+                onEditUserMessage={(turnId) => { void beginEditUserMessage(turnId); }}
                 turnFailedReasonLabels={turnFailedReasonLabels}
                 turnFailedRecoveryLabels={turnFailedRecoveryLabels}
                 safeResumeAction={activeId && resumeCandidateTurnId ? {
@@ -1616,6 +1709,8 @@ function AppShellContent({
                 scrollBehavior={readScrollMotionBehavior()}
                 branchBanner={branchBanner}
                 onBranchBannerClick={handleBranchBannerClick}
+                revisionNavigation={revisionNavigation}
+                onRevisionNavigate={openSessionInChat}
                 onNew={createSession}
                 onPromptSuggestion={(prompt) => composerRef.current?.appendText(prompt)}
                 onContinueDeepResearchHandoff={(run) => {
@@ -1696,12 +1791,30 @@ function AppShellContent({
                 continuing={showContinuingIndicator && !activeStreamingLive}
                 onSend={sendWithAttachments}
                 onStop={stop}
+                revisionNotice={
+                  revisionDraft && activeId === revisionDraft.draftSessionId
+                    ? {
+                        title: getDesktopConversationCopy(uiLocale).actions.revisionBannerTitle,
+                        detail: getDesktopConversationCopy(uiLocale).actions.revisionBannerDetail,
+                        cancelLabel: getDesktopConversationCopy(uiLocale).actions.revisionCancelLabel,
+                        onCancel: () => { void cancelRevisionDraft(); },
+                      }
+                    : undefined
+                }
                 mentionSkills={mentionSkills}
                 onSearchMentionFiles={searchMentionFiles}
                 pendingAttachments={pendingAttachments}
                 onRemoveAttachment={removeAttachment}
-                onPickAttachments={pickAttachments}
-                onAttachFilePaths={attachFilePaths}
+                onPickAttachments={
+                  revisionDraft && activeId === revisionDraft.draftSessionId
+                    ? undefined
+                    : pickAttachments
+                }
+                onAttachFilePaths={
+                  revisionDraft && activeId === revisionDraft.draftSessionId
+                    ? undefined
+                    : attachFilePaths
+                }
                 expertTeams={expertTeams}
                 onStartExpertTeam={handleExpertTeamStart}
                   modelLabel={activeModelLabel ?? newChatModelLabel ?? undefined}

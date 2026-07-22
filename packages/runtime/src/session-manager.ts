@@ -39,6 +39,7 @@ import type {
   CreateSessionInput,
   BranchFromTurnInput,
   RegenerateTurnInput,
+  ReviseBeforeTurnInput,
   UserMessageInput,
   SessionListFilter,
 } from '@maka/core/runtime-inputs';
@@ -500,7 +501,8 @@ export class SessionManager {
     }
     if (inherited.size === 0) return ownUpdates;
 
-    const parentSessionId = (await this.deps.store.readHeader(sessionId)).parentSessionId;
+    const inheritedFrom = await this.deps.store.readHeader(sessionId);
+    const parentSessionId = inheritedFrom.revisionParentSessionId ?? inheritedFrom.parentSessionId;
     if (!parentSessionId) return ownUpdates;
     const inheritedUpdates = await Promise.all(
       [...inherited.values()].map(async (candidate) => {
@@ -567,6 +569,16 @@ export class SessionManager {
       } catch (error) {
         if (policy.kind === 'strict') throw error;
         messagesReadable = false;
+      }
+
+      if (session.revisionState === 'preparing' && messagesReadable) {
+        if (hasRevisionUserMessage(messages)) {
+          await recoverOr(policy, () => this.commitRevisionVersion(session.id), undefined);
+        } else {
+          await recoverOr(policy, () => this.remove(session.id), undefined);
+          recovered.add(session.id);
+          continue;
+        }
       }
 
       if (this.deps.runStore) {
@@ -677,6 +689,14 @@ export class SessionManager {
       sessionId,
       buildStatusPatch(status, this.deps.now(), blockedReason),
     );
+    this.runtimeKernel.updateCachedHeader(sessionId, next);
+    return headerToSummary(next);
+  }
+
+  async commitRevisionVersion(sessionId: string): Promise<SessionSummary> {
+    const current = await this.deps.store.readHeader(sessionId);
+    if (current.revisionState !== 'preparing') return headerToSummary(current);
+    const next = await this.deps.store.updateHeader(sessionId, { revisionState: 'committed' });
     this.runtimeKernel.updateCachedHeader(sessionId, next);
     return headerToSummary(next);
   }
@@ -1497,6 +1517,77 @@ export class SessionManager {
     return this.createBranchSession(sessionId, sourceView, copied, input);
   }
 
+  /**
+   * Create a non-destructive edit-and-resend version. Unlike branchBeforeTurn,
+   * this is not a new sidebar conversation: revision lineage lets hosts fold
+   * every version into one conversation slot while keeping old transcripts.
+   */
+  async reviseBeforeTurn(sessionId: string, input: ReviseBeforeTurnInput): Promise<SessionSummary> {
+    const sourceView = await this.getSessionView(sessionId);
+    const copied = copyMessagesBeforeTurn(sourceView.messages, input.sourceTurnId);
+    if (copied === null) throw new Error(`Cannot revise before unknown turn ${input.sourceTurnId}`);
+    return this.createRevisionSession(sessionId, sourceView, copied, input);
+  }
+
+  private async createRevisionSession(
+    sessionId: string,
+    sourceView: RuntimeReadModelSessionView,
+    copied: StoredMessage[],
+    input: ReviseBeforeTurnInput,
+  ): Promise<SessionSummary> {
+    const header = await this.deps.store.readHeader(sessionId);
+    const revisionRootSessionId = header.revisionRootSessionId ?? sessionId;
+    const family = (await this.deps.store.list()).filter(
+      (candidate) =>
+        candidate.id === revisionRootSessionId ||
+        candidate.revisionRootSessionId === revisionRootSessionId,
+    );
+    const revisionIndex =
+      Math.max(1, ...family.map((candidate) => candidate.revisionIndex ?? 1)) + 1;
+    const next = await this.deps.store.create({
+      cwd: header.cwd,
+      backend: header.backend,
+      llmConnectionSlug: header.llmConnectionSlug,
+      model: header.model,
+      thinkingLevel: header.thinkingLevel,
+      permissionMode: header.permissionMode,
+      collaborationMode: header.collaborationMode,
+      orchestrationMode: header.orchestrationMode ?? 'default',
+      name: header.name,
+      labels: header.labels,
+      // A revision of a real branch remains in that branch's conversation
+      // slot; revision lineage itself must not create a branch banner.
+      parentSessionId: header.parentSessionId,
+      branchOfTurnId: header.branchOfTurnId,
+      revisionRootSessionId,
+      revisionParentSessionId: sessionId,
+      revisionOfTurnId: input.sourceTurnId,
+      revisionIndex,
+      revisionState: 'preparing',
+      status: 'active',
+    });
+    await this.cloneConversationRuntimeLedger(next.id, sourceView, copied);
+    if (copied.length > 0) await this.deps.store.appendMessages(next.id, copied);
+    await this.deps.store.appendMessage(next.id, {
+      type: 'system_note',
+      id: this.deps.newId(),
+      ts: this.deps.now(),
+      kind: 'session_start',
+      data: {
+        revisionRootSessionId,
+        revisionParentSessionId: sessionId,
+        revisionOfTurnId: input.sourceTurnId,
+        revisionIndex,
+        revisionState: 'preparing',
+      },
+    });
+    await this.deps.store.updateHeader(next.id, {
+      isFlagged: header.isFlagged,
+      titleIsManual: header.titleIsManual,
+    });
+    return headerToSummary(await this.deps.store.readHeader(next.id));
+  }
+
   private async createBranchSession(
     sessionId: string,
     sourceView: RuntimeReadModelSessionView,
@@ -1511,6 +1602,7 @@ export class SessionManager {
       model: header.model,
       thinkingLevel: header.thinkingLevel,
       permissionMode: header.permissionMode,
+      collaborationMode: header.collaborationMode,
       orchestrationMode: header.orchestrationMode ?? 'default',
       name: input.name ?? `${header.name} · 分支`,
       labels: header.labels,
@@ -1518,7 +1610,7 @@ export class SessionManager {
       branchOfTurnId: input.sourceTurnId,
       status: 'active',
     });
-    await this.cloneBranchRuntimeLedger(next.id, sourceView, copied);
+    await this.cloneConversationRuntimeLedger(next.id, sourceView, copied);
     if (copied.length > 0) await this.deps.store.appendMessages(next.id, copied);
     await this.deps.store.appendMessage(next.id, {
       type: 'system_note',
@@ -1570,7 +1662,8 @@ export class SessionManager {
       } catch (error) {
         if (!isNotFoundError(error)) throw error;
         try {
-          ownerSessionId = (await this.deps.store.readHeader(ownerSessionId)).parentSessionId;
+          const ownerHeader = await this.deps.store.readHeader(ownerSessionId);
+          ownerSessionId = ownerHeader.revisionParentSessionId ?? ownerHeader.parentSessionId;
         } catch (headerError) {
           if (isNotFoundError(headerError)) return undefined;
           throw headerError;
@@ -1718,7 +1811,7 @@ export class SessionManager {
     );
   }
 
-  private async cloneBranchRuntimeLedger(
+  private async cloneConversationRuntimeLedger(
     childSessionId: string,
     sourceView: RuntimeReadModelSessionView,
     copiedMessages: readonly StoredMessage[],
@@ -1740,7 +1833,7 @@ export class SessionManager {
 
       const runId = this.deps.newId();
       const invocationId = this.deps.newId();
-      const clonedRun = cloneRunHeaderForBranchCreate(
+      const clonedRun = cloneRunHeaderForConversationCopy(
         sourceRun,
         childSessionId,
         runId,
@@ -1751,7 +1844,7 @@ export class SessionManager {
       const sourceTerminalLedger = classifyTerminalRuntimeLedger(sourceRun, sourceEvents);
       const clonedEventBySourceId = new Map<string, RuntimeEvent>();
       for (const event of sourceEvents) {
-        const clonedEvent = cloneRuntimeEventForBranch(event, {
+        const clonedEvent = cloneRuntimeEventForConversationCopy(event, {
           sessionId: childSessionId,
           runId,
           eventId: this.deps.newId(),
@@ -1783,7 +1876,7 @@ export class SessionManager {
             : {}),
           runEventData: {
             recovered: true,
-            recoveryReason: 'branch_runtime_ledger_clone',
+            recoveryReason: 'conversation_runtime_ledger_clone',
             sourceSessionId: sourceRun.sessionId,
             sourceRunId: sourceRun.runId,
           },
@@ -2025,6 +2118,11 @@ export function headerToSummary(h: SessionHeader): SessionSummary {
     ...(h.statusUpdatedAt !== undefined ? { statusUpdatedAt: h.statusUpdatedAt } : {}),
     ...(h.parentSessionId ? { parentSessionId: h.parentSessionId } : {}),
     ...(h.branchOfTurnId ? { branchOfTurnId: h.branchOfTurnId } : {}),
+    ...(h.revisionRootSessionId ? { revisionRootSessionId: h.revisionRootSessionId } : {}),
+    ...(h.revisionParentSessionId ? { revisionParentSessionId: h.revisionParentSessionId } : {}),
+    ...(h.revisionOfTurnId ? { revisionOfTurnId: h.revisionOfTurnId } : {}),
+    ...(h.revisionIndex !== undefined ? { revisionIndex: h.revisionIndex } : {}),
+    ...(h.revisionState ? { revisionState: h.revisionState } : {}),
     backend: h.backend,
     llmConnectionSlug: h.llmConnectionSlug,
     connectionLocked: h.connectionLocked,
@@ -2154,6 +2252,23 @@ interface InterruptedTurnRecovery {
   >;
 }
 
+function hasRevisionUserMessage(messages: readonly StoredMessage[]): boolean {
+  let boundary = -1;
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index]!;
+    if (
+      message.type === 'system_note' &&
+      message.kind === 'session_start' &&
+      message.data &&
+      typeof message.data === 'object' &&
+      'revisionRootSessionId' in message.data
+    ) {
+      boundary = index;
+    }
+  }
+  return boundary >= 0 && messages.slice(boundary + 1).some((message) => message.type === 'user');
+}
+
 function interruptedTurnRecoveries(messages: readonly StoredMessage[]): InterruptedTurnRecovery[] {
   const byTurn = new Map<
     string,
@@ -2216,7 +2331,7 @@ function turnStateLineage(
   };
 }
 
-function cloneRuntimeEventForBranch(
+function cloneRuntimeEventForConversationCopy(
   event: RuntimeEvent,
   ids: { sessionId: string; runId: string; eventId: string; invocationId: string },
 ): RuntimeEvent {
@@ -2229,7 +2344,7 @@ function cloneRuntimeEventForBranch(
   };
 }
 
-function cloneRunHeaderForBranchCreate(
+function cloneRunHeaderForConversationCopy(
   sourceRun: AgentRunHeader,
   childSessionId: string,
   runId: string,

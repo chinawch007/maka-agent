@@ -95,6 +95,11 @@ export interface SessionInspectSummary {
   isArchived: boolean;
   parentSessionId?: string;
   branchOfTurnId?: string;
+  revisionRootSessionId?: string;
+  revisionParentSessionId?: string;
+  revisionOfTurnId?: string;
+  revisionIndex?: number;
+  revisionState?: 'preparing' | 'committed';
 }
 
 export interface SessionInspectDocument {
@@ -180,6 +185,19 @@ export async function inspectSessionDocument(
         ? { parentSessionId: resolvedHeader.parentSessionId }
         : {}),
       ...(resolvedHeader.branchOfTurnId ? { branchOfTurnId: resolvedHeader.branchOfTurnId } : {}),
+      ...(resolvedHeader.revisionRootSessionId
+        ? { revisionRootSessionId: resolvedHeader.revisionRootSessionId }
+        : {}),
+      ...(resolvedHeader.revisionParentSessionId
+        ? { revisionParentSessionId: resolvedHeader.revisionParentSessionId }
+        : {}),
+      ...(resolvedHeader.revisionOfTurnId
+        ? { revisionOfTurnId: resolvedHeader.revisionOfTurnId }
+        : {}),
+      ...(resolvedHeader.revisionIndex !== undefined
+        ? { revisionIndex: resolvedHeader.revisionIndex }
+        : {}),
+      ...(resolvedHeader.revisionState ? { revisionState: resolvedHeader.revisionState } : {}),
     },
     agentRuns,
     diagnostics: agentRuns.flatMap((run) => run.diagnostics),

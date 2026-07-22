@@ -202,6 +202,10 @@ export interface ConversationCopy {
     copyFailed: string;
     copy: string;
     copyMessage: string;
+    editMessage: string;
+    editMessageDisabledRunning: string;
+    editMessageDisabledAttachments: string;
+    editMessageDisabledTransformedText: string;
     copyThinking: string;
     imageAriaLabel: (name: string) => string;
     userAriaLabel: string;
@@ -251,6 +255,10 @@ export interface ConversationCopy {
     noMessages: string;
     branchTitle: (name: string, beforeAbort: boolean) => string;
     branchLabel: (name: string, beforeAbort: boolean) => string;
+    revisionVersionsAriaLabel: string;
+    revisionVersion: (current: number, total: number) => string;
+    previousRevision: string;
+    nextRevision: string;
   };
   sessions: {
     status: Record<SessionStatus, string>;
@@ -359,7 +367,7 @@ const CONVERSATION_COPY = {
       branchTitle: (branch) => branch ? `分支：${branch}` : '选择分支', branchAriaLabel: (branch) => branch ? `切换分支：${branch}` : '选择分支',
     },
     messages: {
-      you: '你', assistant: 'Maka', processing: '正在处理…', continuing: '继续中…', safeResumePending: '正在验证…', safeResume: '安全恢复', thinking: '深度思考', truncated: '已截断', copied: '已复制', copying: '复制中', copyFailed: '复制失败', copy: '复制', copyMessage: '复制消息', copyThinking: '复制思考过程',
+      you: '你', assistant: 'Maka', processing: '正在处理…', continuing: '继续中…', safeResumePending: '正在验证…', safeResume: '安全恢复', thinking: '深度思考', truncated: '已截断', copied: '已复制', copying: '复制中', copyFailed: '复制失败', copy: '复制', copyMessage: '复制消息', editMessage: '编辑并重发', editMessageDisabledRunning: '当前回答仍在进行中，结束后再编辑', editMessageDisabledAttachments: '包含附件的历史消息暂不支持编辑并重发', editMessageDisabledTransformedText: '通过显式技能发送的历史消息暂不支持编辑并重发', copyThinking: '复制思考过程',
       imageAriaLabel: (name) => `查看图片 ${name}`, userAriaLabel: '你发送的消息', assistantAriaLabel: 'Maka 的回答', answerActionsAriaLabel: '本轮回答操作', sourceAriaLabel: '本轮回答的来源', derivativesAriaLabel: '本轮回答的衍生', automationTriggered: '定时任务触发', automationTitle: (id) => `由定时任务触发 · ${id}`,
       thinkingTruncatedTitle: '部分 reasoning 已截断；显示的是最近的内容', outputTruncatedTitle: '助手输出已超过单次回合上限，超出部分未渲染。如需完整内容请重新生成或查看持久化的会话日志。', removeAttachmentAriaLabel: (name) => `移除 ${name}`, aborted: '(已中断)', abortedByStop: '(已中断 · 由停止按钮触发)',
     },
@@ -391,6 +399,7 @@ const CONVERSATION_COPY = {
       clearGoal: (condition, iteration, max, status) => `自主执行目标进行中：「${condition}」（第 ${iteration}/${max} 轮，${status}）。系统每轮后自动续行；点击可清除目标、停止续行。`, clearGoalAriaLabel: (iteration, max) => `清除自主执行目标（已进行 ${iteration}/${max} 轮）`, goalLabel: (iteration, max) => `目标 ${iteration}/${max} · 清除`,
       loadFailed: '对话载入失败', loading: '载入中…', retryLoad: '重试载入', jumpLatest: '跳到最新消息', noMessages: '暂无消息',
       branchTitle: (name, beforeAbort) => beforeAbort ? `从中断前分支自 ${name} · 点击跳回原会话` : `分自 ${name} · 点击跳回原会话`, branchLabel: (name, beforeAbort) => beforeAbort ? `从中断前分支自 ${name}` : `分自 ${name}`,
+      revisionVersionsAriaLabel: '对话版本', revisionVersion: (current, total) => `版本 ${current} / ${total}`, previousRevision: '查看上一版本', nextRevision: '查看下一版本',
     },
     sessions: {
       status: { active: '可继续', running: '进行中', waiting_for_user: '等你确认', blocked: '需要处理', review: '待审核', done: '已完成', archived: '已归档', aborted: '已中止' },
@@ -493,7 +502,7 @@ const CONVERSATION_COPY = {
       branchTitle: (branch) => branch ? `Branch: ${branch}` : 'Choose branch', branchAriaLabel: (branch) => branch ? `Switch branch: ${branch}` : 'Choose branch',
     },
     messages: {
-      you: 'You', assistant: 'Maka', processing: 'Working…', continuing: 'Continuing…', safeResumePending: 'Checking…', safeResume: 'Safe recovery', thinking: 'Thinking', truncated: 'Truncated', copied: 'Copied', copying: 'Copying', copyFailed: 'Copy failed', copy: 'Copy', copyMessage: 'Copy message', copyThinking: 'Copy reasoning',
+      you: 'You', assistant: 'Maka', processing: 'Working…', continuing: 'Continuing…', safeResumePending: 'Checking…', safeResume: 'Safe recovery', thinking: 'Thinking', truncated: 'Truncated', copied: 'Copied', copying: 'Copying', copyFailed: 'Copy failed', copy: 'Copy', copyMessage: 'Copy message', editMessage: 'Edit & resend', editMessageDisabledRunning: 'Wait for this answer to finish before editing', editMessageDisabledAttachments: 'Edit & resend does not yet support messages with attachments', editMessageDisabledTransformedText: 'Edit & resend does not yet support messages sent with an explicit skill', copyThinking: 'Copy reasoning',
       imageAriaLabel: (name) => `View image ${name}`, userAriaLabel: 'Your message', assistantAriaLabel: "Maka's response", answerActionsAriaLabel: 'Response actions', sourceAriaLabel: 'Source of this response', derivativesAriaLabel: 'Responses derived from this one', automationTriggered: 'Triggered by automation', automationTitle: (id) => `Triggered by automation · ${id}`,
       thinkingTruncatedTitle: 'Some reasoning was truncated; showing the most recent content', outputTruncatedTitle: 'The assistant output exceeded the per-turn limit. Regenerate it or inspect the persisted session log for the complete content.', removeAttachmentAriaLabel: (name) => `Remove ${name}`, aborted: '(Interrupted)', abortedByStop: '(Interrupted · Stop button)',
     },
@@ -525,6 +534,7 @@ const CONVERSATION_COPY = {
       clearGoal: (condition, iteration, max, status) => `Autonomous goal in progress: “${condition}” (iteration ${iteration}/${max}, ${status}). Maka continues after each iteration; click to clear the goal and stop continuing.`, clearGoalAriaLabel: (iteration, max) => `Clear autonomous goal after ${iteration}/${max} iterations`, goalLabel: (iteration, max) => `Goal ${iteration}/${max} · Clear`,
       loadFailed: 'Conversation failed to load', loading: 'Loading…', retryLoad: 'Retry', jumpLatest: 'Jump to latest message', noMessages: 'No messages yet',
       branchTitle: (name, beforeAbort) => beforeAbort ? `Branched before interruption from ${name} · Click to return` : `Branched from ${name} · Click to return`, branchLabel: (name, beforeAbort) => beforeAbort ? `Branched before interruption from ${name}` : `Branched from ${name}`,
+      revisionVersionsAriaLabel: 'Conversation versions', revisionVersion: (current, total) => `Version ${current} of ${total}`, previousRevision: 'View previous version', nextRevision: 'View next version',
     },
     sessions: {
       status: { active: 'Ready', running: 'Running', waiting_for_user: 'Waiting for you', blocked: 'Needs attention', review: 'Review', done: 'Done', archived: 'Archived', aborted: 'Stopped' },

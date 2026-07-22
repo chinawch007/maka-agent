@@ -5,7 +5,10 @@ import {
   ArrowDown,
   ArrowRight,
   BookOpen,
+  ChevronLeft,
+  ChevronRight,
   GitBranch,
+  History,
   Target,
   Sparkles,
 } from './icons.js';
@@ -126,6 +129,11 @@ export function ChatView(props: {
   turnFooterActionsByTurn?: Record<string, ReadonlyArray<TurnFooterActionMeta>>;
   onTurnFooterAction?: (turnId: string, actionId: TurnFooterActionMeta['id']) => void;
   /**
+   * Edit-and-resend for a user turn. Desktop owns revision draft creation
+   * (branch-before + composer refill); ChatView only forwards the click.
+   */
+  onEditUserMessage?: (turnId: string) => void;
+  /**
    * PR109e-d/e: per-turn metadata for failed banner + lineage badges.
    * Renderer computes from materialized turns + lineage map + the
    * generalized error-class mapping (`describeTurnErrorClass()`),
@@ -168,6 +176,14 @@ export function ChatView(props: {
     fromAbortedTurn?: boolean;
   };
   onBranchBannerClick?: (parentSessionId: string) => void;
+  /** Edit-and-resend versions stay in one conversation slot. */
+  revisionNavigation?: {
+    current: number;
+    total: number;
+    previousSessionId?: string;
+    nextSessionId?: string;
+  };
+  onRevisionNavigate?: (sessionId: string) => void;
   /**
    * Host reader for image attachment bytes, threaded to each turn's user-message
    * thumbnails. The desktop shell passes its preload `attachments.readBytes`;
@@ -248,6 +264,18 @@ export function ChatView(props: {
   // One rail tick per turn that carries a user prompt (Codex-style prompt
   // navigation). Memoized so the rail's IntersectionObserver isn't rebuilt
   // on every render.
+  const transformedUserTurnIds = useMemo(
+    () => new Set(
+      props.messages.flatMap((message) =>
+        message.type === 'user' &&
+        message.displayText !== undefined &&
+        message.displayText !== message.text
+          ? [message.turnId]
+          : [],
+      ),
+    ),
+    [props.messages],
+  );
   const promptRailTurns = useMemo(
     () =>
       turns
@@ -267,6 +295,12 @@ export function ChatView(props: {
   onTurnFooterActionRef.current = props.onTurnFooterAction;
   const stableTurnFooterAction = useCallback(
     (turnId: string, actionId: TurnFooterActionMeta['id']) => onTurnFooterActionRef.current?.(turnId, actionId),
+    [],
+  );
+  const onEditUserMessageRef = useRef(props.onEditUserMessage);
+  onEditUserMessageRef.current = props.onEditUserMessage;
+  const stableEditUserMessage = useCallback(
+    (turnId: string) => onEditUserMessageRef.current?.(turnId),
     [],
   );
   const onLineageBadgeClickRef = useRef(props.onLineageBadgeClick);
@@ -393,6 +427,12 @@ export function ChatView(props: {
         />
       )}
       <div className="maka-chat-shell">
+        {props.revisionNavigation && (
+          <SessionRevisionNavigator
+            navigation={props.revisionNavigation}
+            onNavigate={props.onRevisionNavigate}
+          />
+        )}
         {props.branchBanner && (
           <SessionBranchBanner
             banner={props.branchBanner}
@@ -436,6 +476,11 @@ export function ChatView(props: {
                   userLabel={props.userLabel}
                   footerActions={props.turnFooterActionsByTurn?.[turn.turnId]}
                   onFooterAction={stableTurnFooterAction}
+                  onEditUserMessage={props.onEditUserMessage ? stableEditUserMessage : undefined}
+                  editUserMessageTransformed={transformedUserTurnIds.has(turn.turnId)}
+                  editUserMessageDisabled={
+                    streamingActive || props.activeSession?.status === 'running'
+                  }
                   failedReasonLabel={props.turnFailedReasonLabels?.[turn.turnId]}
                   failedRecoveryLabel={props.turnFailedRecoveryLabels?.[turn.turnId]}
                   safeResumeAction={props.safeResumeAction?.turnId === turn.turnId
@@ -634,6 +679,51 @@ export function DeepResearchProgressPanel({
  * when the active session has `parentSessionId` set. Click jumps the
  * user back to the parent session.
  */
+function SessionRevisionNavigator(props: {
+  navigation: {
+    current: number;
+    total: number;
+    previousSessionId?: string;
+    nextSessionId?: string;
+  };
+  onNavigate?: (sessionId: string) => void;
+}) {
+  const copy = getConversationCopy(useUiLocale()).chat;
+  const { navigation } = props;
+  return (
+    <div
+      className="maka-session-revision-nav"
+      role="toolbar"
+      aria-label={copy.revisionVersionsAriaLabel}
+    >
+      <History size={12} aria-hidden="true" />
+      <span>{copy.revisionVersion(navigation.current, navigation.total)}</span>
+      <BaseButton
+        type="button"
+        className="maka-session-revision-nav-action"
+        disabled={!navigation.previousSessionId}
+        aria-label={copy.previousRevision}
+        onClick={() => {
+          if (navigation.previousSessionId) props.onNavigate?.(navigation.previousSessionId);
+        }}
+      >
+        <ChevronLeft size={13} aria-hidden="true" />
+      </BaseButton>
+      <BaseButton
+        type="button"
+        className="maka-session-revision-nav-action"
+        disabled={!navigation.nextSessionId}
+        aria-label={copy.nextRevision}
+        onClick={() => {
+          if (navigation.nextSessionId) props.onNavigate?.(navigation.nextSessionId);
+        }}
+      >
+        <ChevronRight size={13} aria-hidden="true" />
+      </BaseButton>
+    </div>
+  );
+}
+
 function SessionBranchBanner(props: {
   banner: {
     parentSessionId: string;

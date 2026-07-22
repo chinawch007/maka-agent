@@ -31,6 +31,11 @@ export interface CreateSessionInput {
   blockedReason?: SessionBlockedReason;
   parentSessionId?: string;
   branchOfTurnId?: string;
+  revisionRootSessionId?: string;
+  revisionParentSessionId?: string;
+  revisionOfTurnId?: string;
+  revisionIndex?: number;
+  revisionState?: 'preparing' | 'committed';
   labels?: string[];
 }
 
@@ -95,6 +100,10 @@ export interface RegenerateTurnInput {
 export interface BranchFromTurnInput {
   sourceTurnId: string;
   name?: string;
+}
+
+export interface ReviseBeforeTurnInput {
+  sourceTurnId: string;
 }
 
 export interface SessionListFilter {
