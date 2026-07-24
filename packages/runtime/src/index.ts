@@ -1347,40 +1347,48 @@ export type {
 } from './goal-turn-lifecycle.js';
 
 export {
+  // skills-metadata
   MAX_SKILL_BODY_CHARS,
   MAX_SKILL_TOOL_BODY_CHARS,
+  parseSkillFrontMatter,
+  validateSkillMetadata,
+  // skills-state
+  readSkillRuntimeState,
+  writeSkillRuntimeState,
+  writeSkillRuntimePreferences,
+  // skills-discovery
+  resolveSkillDiscoveryPaths,
+  scanSkills,
+  scanSkillsWithDiagnostics,
+  scanWorkspaceSkills,
+  scanWorkspaceSkillsWithDiagnostics,
+  // skills-context
   MAX_SKILLS_PROMPT_CHARS,
   MIN_SKILLS_PROMPT_TOKENS,
   MAX_SKILLS_PROMPT_TOKENS,
   SKILLS_PROMPT_CONTEXT_RATIO,
   resolveSkillsPromptCharBudget,
-  scanWorkspaceSkills,
-  scanWorkspaceSkillsWithDiagnostics,
-  scanSkills,
-  scanSkillsWithDiagnostics,
-  resolveSkillDiscoveryPaths,
   buildSkillsPromptFragment,
   buildSkillsPromptFragmentWithReport,
   selectSkillsForContext,
   selectSkillScanForContext,
   searchSkills,
   loadSkillInstructions,
+  gateSkillsByHostCapabilities,
+  // skills-agent-tools
   buildSkillAgentTool,
   buildSkillSearchAgentTool,
   SkillShadowSelectionTracker,
   SKILL_TOOL_NAME,
   SKILL_SEARCH_TOOL_NAME,
-  gateSkillsByHostCapabilities,
-  parseSkillFrontMatter,
-  validateSkillMetadata,
-  readSkillRuntimeState,
-  writeSkillRuntimeState,
-  writeSkillRuntimePreferences,
+} from './skills.js';
+export {
+  // path-containment (contained I/O moved in #1408)
   readContainedRegularFile,
   readContainedRegularTextFile,
   writeContainedRegularTextFile,
   isRecord,
-} from './skills.js';
+} from './path-containment.js';
 export {
   listInvocableSkills,
   resolveSkillInvocations,
@@ -1410,21 +1418,29 @@ export {
 } from './path-containment.js';
 export type { PathInsideApi } from './path-containment.js';
 export type {
+  // skills-state
   SkillRuntimeStatus,
+  SkillRuntimePreference,
+  SkillRuntimeStateReadResult,
+  // skills-discovery
   SkillScope,
   SkillDiscoverySource,
-  SkillRuntimePreference,
+  SkillDiscoveryEntry,
+  SkillSource,
+  SkillSourceResolver,
+  RuntimeSkillDefinition,
+  ScannedSkill,
+  SkillScanDiagnostic,
+  SkillScanResult,
+  SkillDiscoveryDiagnostic,
+  RejectedSkillDefinition,
+  // skills-metadata
   SkillManifest,
   SkillValidationSeverity,
   SkillValidationCode,
   SkillValidationIssue,
   SkillMetadataValidationResult,
-  SkillScanDiagnostic,
-  SkillScanResult,
-  SkillDiscoveryDiagnostic,
-  RejectedSkillDefinition,
-  RuntimeSkillDefinition,
-  ScannedSkill,
+  // skills-context
   HostCapabilities,
   HostCapabilitiesResolver,
   SkillCatalogBudgetOptions,
@@ -1435,13 +1451,10 @@ export type {
   SkillsPromptFragmentResult,
   SkillSearchMatch,
   SkillSearchResult,
-  SkillToolOptions,
   SkillHostCompatibility,
   GatedSkill,
   LoadedSkillInstructions,
   LoadSkillInstructionsResult,
-  SkillRuntimeStateReadResult,
-  SkillSource,
-  SkillSourceResolver,
-  SkillDiscoveryEntry,
+  // skills-agent-tools
+  SkillToolOptions,
 } from './skills.js';
