@@ -107,49 +107,63 @@ describe('localized conversation journey', () => {
     assert.match(en, /Go to model settings/);
   });
 
-  it('renders the compact Plan Mode switch only when the session action is available', () => {
-    const inactive = render(
+  it('keeps Plan Mode out of the toolbar and reachable from the ＋ menu (#1433)', () => {
+    const markup = render(
       'zh',
-      <Composer onSend={() => {}} onStop={() => {}} onPlanModeChange={() => {}} />,
+      <Composer onSend={() => {}} onStop={() => {}} onPickAttachments={() => {}} onPlanModeChange={() => {}} />,
     );
-    assert.match(inactive, /maka-composer-plan-mode-control/);
-    assert.match(inactive, />Plan</);
-    assert.match(inactive, /role="switch"/);
-    assert.match(inactive, /aria-label="开启 Plan Mode"/);
-    assert.match(inactive, /aria-checked="false"/);
+    // The toolbar no longer carries a standalone Plan switch…
+    assert.doesNotMatch(markup, /maka-composer-plan-mode-control/);
+    // …but the ＋ trigger is present so the mode stays reachable from the menu.
+    assert.match(markup, /aria-label="添加"/);
+  });
 
-    const active = render(
-      'en',
+  it('keeps the ＋ menu available when only mode switches are wired', () => {
+    const markup = render('zh', <Composer onSend={() => {}} onStop={() => {}} onPlanModeChange={() => {}} />);
+    assert.match(markup, /aria-label="添加"/);
+    assert.doesNotMatch(markup, /maka-composer-plan-mode-control/);
+  });
+
+  it('shows a quiet Plan indicator next to permission mode only while Plan is active', () => {
+    const on = render(
+      'zh',
+      <Composer onSend={() => {}} onStop={() => {}} planModeActive onPlanModeChange={() => {}} />,
+    );
+    assert.match(on, /maka-composer-mode-indicator/);
+    assert.match(on, /Plan 模式已启用/);
+    // Same visual language as the permission select: a quiet text BUTTON
+    // (no chevron — it cannot drop down); clicking turns the mode off.
+    assert.match(on, /<button[^>]*maka-composer-mode-indicator/);
+
+    const off = render('zh', <Composer onSend={() => {}} onStop={() => {}} onPlanModeChange={() => {}} />);
+    assert.doesNotMatch(off, /maka-composer-mode-indicator/);
+  });
+
+  it('keeps the active-mode indicator visible but disabled with reason while streaming', () => {
+    const markup = render(
+      'zh',
       <Composer
         onSend={() => {}}
         onStop={() => {}}
-        planModeActive
-        onPlanModeChange={() => {}}
+        streaming
+        swarmModeActive
+        swarmModeDisabledReason="等待流式输出结束"
+        onSwarmModeChange={() => {}}
       />,
     );
-    assert.match(active, /aria-label="Disable Plan Mode"/);
-    assert.match(active, /aria-checked="true"/);
-
-    const unavailable = render('zh', <Composer onSend={() => {}} onStop={() => {}} />);
-    assert.doesNotMatch(unavailable, /maka-composer-plan-mode-control/);
+    assert.match(markup, /maka-composer-mode-indicator/);
+    assert.match(markup, /Swarm 模式已启用/);
+    assert.match(markup, /disabled=""/);
+    assert.match(markup, /等待流式输出结束/);
   });
 
-  it('renders the compact Swarm Mode switch with localized state labels', () => {
-    const inactive = render(
+  it('keeps Swarm Mode out of the toolbar (#1433)', () => {
+    const markup = render(
       'zh',
-      <Composer onSend={() => {}} onStop={() => {}} onSwarmModeChange={() => {}} />,
+      <Composer onSend={() => {}} onStop={() => {}} onPickAttachments={() => {}} onSwarmModeChange={() => {}} />,
     );
-    assert.match(inactive, /maka-composer-swarm-mode-control/);
-    assert.match(inactive, />Swarm</);
-    assert.match(inactive, /aria-label="开启 Swarm Mode"/);
-    assert.match(inactive, /aria-checked="false"/);
-
-    const active = render(
-      'en',
-      <Composer onSend={() => {}} onStop={() => {}} swarmModeActive onSwarmModeChange={() => {}} />,
-    );
-    assert.match(active, /aria-label="Disable Swarm Mode"/);
-    assert.match(active, /aria-checked="true"/);
+    assert.doesNotMatch(markup, /maka-composer-swarm-mode-control/);
+    assert.match(markup, /aria-label="添加"/);
   });
 
   it('localizes permission and question chrome while preserving raw values', () => {
